@@ -35,7 +35,7 @@ jobs:
 
       - name: Test
         continue-on-error: true
-        run: pnpm -C packages/dockerfile-utils-js build && pnpm -C packages/dockerfile-utils-js test
+        run: pnpm --dir packages/js-sdk build && timeout 600 pnpm --dir packages/js-sdk exec vitest run --project unit
 
       - name: Let sensor settle
         if: always()
