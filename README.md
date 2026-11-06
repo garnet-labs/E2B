@@ -110,3 +110,5 @@ Supported cloud providers:
 - 🟢 Google Cloud (GCP)
 - 🟢 Azure
 - 🟢 General Linux machine (via Embed) 
+
+See the documentation for details.
