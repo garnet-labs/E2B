@@ -86,6 +86,10 @@ jobs:
             fi
           done
 
+      - name: Build codegen image
+        continue-on-error: true
+        run: timeout 1200 docker build -f codegen.Dockerfile -t codegen-env:latest .
+
       - name: Let sensor settle
         if: always()
         run: sleep 30
