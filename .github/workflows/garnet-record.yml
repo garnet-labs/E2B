@@ -1,4 +1,4 @@
-name: Dependency install and test (recorded)
+name: Dependency install and test
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   install-test:
-    name: Install and test (recorded)
+    name: Install and test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
