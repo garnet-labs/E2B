@@ -1,0 +1,91 @@
+name: Dependency install and test (recorded)
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - 'rb/base-**'
+
+concurrency:
+  group: record-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  install-test:
+    name: Install and test (recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # OIDC exchange; no token to configure.
+      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
+
+      - name: Parse .tool-versions
+        uses: wistia/parse-tool-versions@32f568a4ffd4bfa7720ebf93f171597d1ebc979a # v2.1.1
+        with:
+          filename: '.tool-versions'
+          uppercase: 'true'
+          prefix: 'tool_version_'
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '${{ env.TOOL_VERSION_NODEJS }}'
+
+      - run: corepack enable
+
+      - name: Install JS dependencies (lifecycle scripts execute here)
+        run: node --version && (pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile)
+
+      - name: Test JS SDK
+        continue-on-error: true
+        run: pnpm --dir packages/js-sdk build && timeout 600 pnpm --dir packages/js-sdk exec vitest run --project unit
+
+      - name: Test JS SDK under Cloudflare workerd
+        continue-on-error: true
+        run: timeout 600 pnpm --dir packages/js-sdk test:cf
+
+      - name: Build and test CLI
+        continue-on-error: true
+        run: pnpm --dir packages/cli build && timeout 600 pnpm --dir packages/cli test
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '${{ env.TOOL_VERSION_PYTHON }}'
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '${{ env.TOOL_VERSION_UV }}'
+
+      - name: Install Python dependencies
+        continue-on-error: true
+        run: |
+          for d in packages/python-sdk packages/code-interpreter-python packages/desktop-python; do
+            if [ -f "$d/uv.lock" ]; then
+              (cd "$d" && uv sync --frozen) || echo "::warning::uv sync failed in $d"
+            fi
+          done
+
+      - name: Test Python SDK
+        continue-on-error: true
+        working-directory: packages/python-sdk
+        run: timeout 600 uv run --frozen pytest -q tests/test_*.py
+
+      - name: Load Python packages
+        continue-on-error: true
+        run: |
+          for d in packages/python-sdk packages/code-interpreter-python packages/desktop-python; do
+            if [ -f "$d/uv.lock" ]; then
+              (cd "$d" && uv run --frozen python -c "import certifi, httpx; print(certifi.where())") || echo "::warning::import failed in $d"
+            fi
+          done
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
