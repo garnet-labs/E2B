@@ -45,6 +45,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build JavaScript workspace prerequisite
+        run: pnpm --dir packages/dockerfile-utils-js build
+
       - name: Lint affected JavaScript packages
         run: pnpm --dir packages/js-sdk lint && pnpm --dir packages/cli lint
 
