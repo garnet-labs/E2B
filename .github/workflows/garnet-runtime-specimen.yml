@@ -1,0 +1,109 @@
+name: Garnet runtime specimen
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'cursor/*-runtime-base-d589'
+
+permissions: {}
+
+concurrency:
+  group: garnet-runtime-specimen-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  javascript:
+    name: JavaScript install, lint, typecheck, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
+
+      - name: Parse tool versions
+        uses: wistia/parse-tool-versions@32f568a4ffd4bfa7720ebf93f171597d1ebc979a # v2.1.1
+        with:
+          filename: '.tool-versions'
+          uppercase: 'true'
+          prefix: 'tool_version_'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '${{ env.TOOL_VERSION_NODEJS }}'
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint affected JavaScript packages
+        run: pnpm --dir packages/js-sdk lint && pnpm --dir packages/cli lint
+
+      - name: Typecheck affected JavaScript packages
+        run: pnpm --dir packages/js-sdk typecheck && pnpm --dir packages/cli typecheck
+
+      - name: Build affected JavaScript packages
+        run: pnpm --dir packages/js-sdk build && pnpm --dir packages/cli build
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
+
+  python:
+    name: Python install, lint, typecheck, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/python-sdk
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
+
+      - name: Parse tool versions
+        uses: wistia/parse-tool-versions@32f568a4ffd4bfa7720ebf93f171597d1ebc979a # v2.1.1
+        with:
+          filename: '.tool-versions'
+          uppercase: 'true'
+          prefix: 'tool_version_'
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '${{ env.TOOL_VERSION_PYTHON }}'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '${{ env.TOOL_VERSION_UV }}'
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Lint Python SDK
+        run: uv run --frozen make lint
+
+      - name: Typecheck Python SDK
+        run: uv run --frozen make typecheck
+
+      - name: Build Python SDK
+        run: uv build
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
