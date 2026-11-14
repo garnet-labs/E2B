@@ -43,6 +43,11 @@ jobs:
       - name: Install JS dependencies (lifecycle scripts execute here)
         run: node --version && (pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile)
 
+      - name: Build JS SDK and CLI
+        run: |
+          pnpm --dir packages/js-sdk run build
+          pnpm --dir packages/cli run build
+
       - name: Test JS SDK
         continue-on-error: true
         run: pnpm --dir packages/js-sdk build && timeout 600 pnpm --dir packages/js-sdk exec vitest run --project unit
