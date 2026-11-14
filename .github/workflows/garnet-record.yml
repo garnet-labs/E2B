@@ -51,6 +51,15 @@ jobs:
         continue-on-error: true
         run: timeout 600 pnpm --dir packages/js-sdk test:cf
 
+      - name: Check generated JS SDK API types
+        continue-on-error: true
+        env:
+          # Redocly CLI sends usage telemetry by default; codegen in CI has no reason to.
+          REDOCLY_TELEMETRY: 'off'
+        run: |
+          pnpm --dir packages/js-sdk generate:api
+          git diff --exit-code -- packages/js-sdk/src/api/schema.gen.ts
+
       - name: Build and test CLI
         continue-on-error: true
         run: pnpm --dir packages/cli build && timeout 600 pnpm --dir packages/cli test
