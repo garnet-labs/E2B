@@ -51,6 +51,14 @@ jobs:
         continue-on-error: true
         run: timeout 600 pnpm --dir packages/js-sdk test:cf
 
+      # Uses the runner's preinstalled Google Chrome; calling vitest directly
+      # skips pretest:browser, which downloads Playwright's Chromium.
+      - name: Test JS SDK in the browser
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_BROWSER_CHANNEL: chrome
+        run: timeout 900 pnpm --dir packages/js-sdk exec vitest run --config tests/runtimes/browser/vitest.config.mts
+
       - name: Build and test CLI
         continue-on-error: true
         run: pnpm --dir packages/cli build && timeout 600 pnpm --dir packages/cli test
