@@ -53,6 +53,9 @@ jobs:
 
       - name: Check generated JS SDK API types
         continue-on-error: true
+        env:
+          # Redocly CLI sends usage telemetry by default; codegen in CI has no reason to.
+          REDOCLY_TELEMETRY: 'off'
         run: |
           pnpm --dir packages/js-sdk generate:api
           git diff --exit-code -- packages/js-sdk/src/api/schema.gen.ts
