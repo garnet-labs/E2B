@@ -105,7 +105,13 @@ export default defineConfig({
       // screenshot is a picture of a blank page. Off by default it would write
       // one PNG per failed test into .vitest-attachments/.
       screenshotFailures: false,
-      provider: playwright(),
+      // PLAYWRIGHT_BROWSER_CHANNEL=chrome drives an installed Google Chrome (CI
+      // runners ship one) instead of Playwright's downloaded Chromium build.
+      provider: playwright(
+        process.env.PLAYWRIGHT_BROWSER_CHANNEL
+          ? { launchOptions: { channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL } }
+          : {}
+      ),
       instances: [{ browser: 'chromium' }],
     },
   },
