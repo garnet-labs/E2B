@@ -51,6 +51,10 @@ jobs:
         continue-on-error: true
         run: timeout 600 pnpm --dir packages/js-sdk test:cf
 
+      - name: Test JS SDK in the browser
+        continue-on-error: true
+        run: timeout 900 pnpm --dir packages/js-sdk test:browser
+
       - name: Build and test CLI
         continue-on-error: true
         run: pnpm --dir packages/cli build && timeout 600 pnpm --dir packages/cli test
