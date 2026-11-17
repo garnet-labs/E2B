@@ -45,6 +45,18 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 403:
+        response_403 = Error.from_dict(response.json())
+
+        return response_403
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -71,7 +83,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: TemplateBuildRequestV3,
 ) -> Response[Union[Error, TemplateRequestResponseV3]]:
-    """Create a new template
+    """Create template (v3)
+
+     Create a new template
 
     Args:
         body (TemplateBuildRequestV3):
@@ -100,7 +114,9 @@ def sync(
     client: AuthenticatedClient,
     body: TemplateBuildRequestV3,
 ) -> Optional[Union[Error, TemplateRequestResponseV3]]:
-    """Create a new template
+    """Create template (v3)
+
+     Create a new template
 
     Args:
         body (TemplateBuildRequestV3):
@@ -124,7 +140,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: TemplateBuildRequestV3,
 ) -> Response[Union[Error, TemplateRequestResponseV3]]:
-    """Create a new template
+    """Create template (v3)
+
+     Create a new template
 
     Args:
         body (TemplateBuildRequestV3):
@@ -151,7 +169,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: TemplateBuildRequestV3,
 ) -> Optional[Union[Error, TemplateRequestResponseV3]]:
-    """Create a new template
+    """Create template (v3)
+
+     Create a new template
 
     Args:
         body (TemplateBuildRequestV3):

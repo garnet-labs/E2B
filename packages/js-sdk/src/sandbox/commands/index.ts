@@ -1,10 +1,4 @@
-import {
-  Client,
-  Code,
-  ConnectError,
-  Transport,
-  createClient,
-} from '@connectrpc/connect'
+import { Client, Transport, createClient } from '@connectrpc/connect'
 
 import { compareVersions } from 'compare-versions'
 import {
@@ -12,24 +6,40 @@ import {
   ConnectionOpts,
   KEEPALIVE_PING_HEADER,
   KEEPALIVE_PING_INTERVAL_SEC,
+  setupRequestController,
   Username,
 } from '../../connectionConfig'
-import { handleProcessStartEvent } from '../../envd/api'
 import {
+  checkSandboxHealth,
+  EnvdApiClient,
+  handleProcessStartEvent,
+} from '../../envd/api'
+import {
+  ConnectResponse,
   Process as ProcessService,
-  Signal,
+  StartResponse,
 } from '../../envd/process/process_pb'
-import { authenticationHeader, handleRpcError } from '../../envd/rpc'
+import {
+  authenticationHeader,
+  handleRpcErrorWithHealthCheck,
+  killProcess,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
 import { ENVD_COMMANDS_STDIN, ENVD_ENVD_CLOSE } from '../../envd/versions'
-import { SandboxError } from '../../errors'
-import { CommandHandle, CommandResult } from './commandHandle'
+import { InvalidArgumentError, SandboxError } from '../../errors'
+import { CommandHandle, CommandOutput, CommandResult } from './commandHandle'
+import { CommandInputHandle, CommandStreamInputOpts } from './inputHandle'
 export { Pty } from './pty'
+export type { CommandStreamInputOpts }
+
+const DEFAULT_SHELL = ['/bin/bash', '-l', '-c']
 
 /**
  * Options for sending a command request.
  */
-export interface CommandRequestOpts
-  extends Partial<Pick<ConnectionOpts, 'requestTimeoutMs'>> {}
+export interface CommandRequestOpts extends Partial<
+  Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>
+> {}
 
 /**
  * Options for starting a new command.
@@ -61,6 +71,14 @@ export interface CommandStartOpts extends CommandRequestOpts {
    */
   envs?: Record<string, string>
   /**
+   * Shell used to run the command, as the executable followed by its arguments.
+   * The command is passed as the last argument, e.g. `['/bin/sh', '-c']` runs `/bin/sh -c <cmd>`.
+   * Throws {@link InvalidArgumentError} if `shell` is not an array, is empty, or its first element (the executable) is empty.
+   *
+   * @default `['/bin/bash', '-l', '-c']`
+   */
+  shell?: readonly string[]
+  /**
    * Callback for command stdout output.
    */
   onStdout?: (data: string) => void | Promise<void>
@@ -68,6 +86,14 @@ export interface CommandStartOpts extends CommandRequestOpts {
    * Callback for command stderr output.
    */
   onStderr?: (data: string) => void | Promise<void>
+  /**
+   * If false, stdout and stderr are not accumulated in memory and are
+   * `undefined` on the {@link CommandHandle} and {@link CommandResult}.
+   * Use `onStdout`/`onStderr` to consume the output instead.
+   *
+   * @default true
+   */
+  retainOutput?: boolean
   /**
    * If true, command stdin is kept open and you can send data to it using {@link Commands.sendStdin} or {@link CommandHandle.sendStdin}.
    * @default false
@@ -86,7 +112,7 @@ export interface CommandStartOpts extends CommandRequestOpts {
  */
 export type CommandConnectOpts = Pick<
   CommandStartOpts,
-  'onStderr' | 'onStdout' | 'timeoutMs'
+  'onStderr' | 'onStdout' | 'retainOutput' | 'timeoutMs'
 > &
   CommandRequestOpts
 
@@ -125,19 +151,22 @@ export interface ProcessInfo {
  */
 export class Commands {
   protected readonly rpc: Client<typeof ProcessService>
+  private readonly streamingRpc: Client<typeof ProcessService>
 
   private readonly defaultProcessConnectionTimeout = 60_000 // 60 seconds
   private readonly envdVersion: string
+  private readonly checkHealth: SandboxHealthCheck
 
   constructor(
     transport: Transport,
+    private readonly envdApi: EnvdApiClient,
     private readonly connectionConfig: ConnectionConfig,
-    metadata: {
-      version: string
-    }
+    streamingTransport: Transport
   ) {
     this.rpc = createClient(ProcessService, transport)
-    this.envdVersion = metadata.version
+    this.streamingRpc = createClient(ProcessService, streamingTransport)
+    this.envdVersion = envdApi.version
+    this.checkHealth = () => checkSandboxHealth(this.envdApi)
   }
 
   /**
@@ -160,7 +189,10 @@ export class Commands {
       const res = await this.rpc.list(
         {},
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
 
@@ -173,7 +205,7 @@ export class Commands {
         ...(p.config!.cwd && { cwd: p.config!.cwd }),
       }))
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -209,17 +241,60 @@ export class Commands {
           },
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
   /**
-   * @hidden
-   * @internal
+   * Open a persistent input stream to a command.
+   *
+   * Input sent through this stream is ordered relative to other `send` calls.
+   * Use this instead of {@link Commands.sendStdin} when ordering matters; each
+   * `sendStdin` call is a separate request. The stream sends keepalive messages
+   * while idle.
+   *
+   * In browsers, this requires fetch request-body streaming support (Chromium
+   * over HTTP/2).
+   *
+   * @param pid Process ID of the command.
+   * @param opts Optional stream timeout and abort signal. `timeoutMs` defaults to `STREAM_INPUT_TIMEOUT_MS` (60_000 milliseconds).
+   * @returns A handle whose `send()` method queues input in order and whose `close()` method ends the stream and waits for envd.
+   * @throws {NotFoundError} If the command does not exist, surfaced from `send()` or `close()`.
+   * @throws {TimeoutError} If the stream timeout expires, surfaced from `send()` or `close()`.
+   * @example
+   * ```ts
+   * const input = sandbox.commands.streamInput(pid)
+   * await input.send('hello\n')
+   * await input.close()
+   * ```
+   */
+  streamInput(
+    pid: number,
+    opts: CommandStreamInputOpts = {}
+  ): CommandInputHandle {
+    return new CommandInputHandle(
+      this.streamingRpc,
+      pid,
+      'stdin',
+      opts,
+      this.checkHealth
+    )
+  }
+
+  /**
+   * Close command stdin.
+   *
+   * This signals EOF to the command. The command must have been started with `stdin: true`.
+   *
+   * @param pid process ID of the command. You can get the list of running commands using {@link Commands.list}.
+   * @param opts connection options.
    */
   async closeStdin(pid: number, opts?: CommandRequestOpts): Promise<void> {
     if (!this.supportsStdinClose) {
@@ -239,11 +314,14 @@ export class Commands {
           },
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -257,32 +335,12 @@ export class Commands {
    * @returns `true` if the command was killed, `false` if the command was not found.
    */
   async kill(pid: number, opts?: CommandRequestOpts): Promise<boolean> {
-    try {
-      await this.rpc.sendSignal(
-        {
-          process: {
-            selector: {
-              case: 'pid',
-              value: pid,
-            },
-          },
-          signal: Signal.SIGKILL,
-        },
-        {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
-        }
-      )
-
-      return true
-    } catch (err) {
-      if (err instanceof ConnectError) {
-        if (err.code === Code.NotFound) {
-          return false
-        }
-      }
-
-      throw handleRpcError(err)
-    }
+    return killProcess(
+      this.rpc,
+      pid,
+      this.connectionConfig.getSignal(opts?.requestTimeoutMs, opts?.signal),
+      this.checkHealth
+    )
   }
 
   /**
@@ -294,20 +352,17 @@ export class Commands {
    *
    * @returns `CommandHandle` handle to interact with the running command.
    */
-  async connect(
+  async connect<RetainOutput extends boolean | undefined = undefined>(
     pid: number,
-    opts?: CommandConnectOpts
-  ): Promise<CommandHandle> {
+    opts?: CommandConnectOpts & { retainOutput?: RetainOutput }
+  ): Promise<CommandHandle<CommandOutput<RetainOutput>>> {
     const requestTimeoutMs =
       opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
 
-    const controller = new AbortController()
-
-    const reqTimeout = requestTimeoutMs
-      ? setTimeout(() => {
-          controller.abort()
-        }, requestTimeoutMs)
-      : undefined
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
 
     const events = this.rpc.connect(
       {
@@ -327,23 +382,12 @@ export class Commands {
       }
     )
 
-    try {
-      const pid = await handleProcessStartEvent(events)
-
-      clearTimeout(reqTimeout)
-
-      return new CommandHandle(
-        pid,
-        () => controller.abort(),
-        () => this.kill(pid),
-        events,
-        opts?.onStdout,
-        opts?.onStderr,
-        undefined
-      )
-    } catch (err) {
-      throw handleRpcError(err)
-    }
+    return this.createHandle<CommandOutput<RetainOutput>>(
+      events,
+      clearStartTimeout,
+      cleanup,
+      opts
+    )
   }
 
   /**
@@ -354,10 +398,13 @@ export class Commands {
    *
    * @returns `CommandResult` result of the command execution.
    */
-  async run(
+  async run<RetainOutput extends boolean | undefined = undefined>(
     cmd: string,
-    opts?: CommandStartOpts & { background?: false }
-  ): Promise<CommandResult>
+    opts?: CommandStartOpts & {
+      background?: false
+      retainOutput?: RetainOutput
+    }
+  ): Promise<CommandResult<CommandOutput<RetainOutput>>>
 
   /**
    * Start a new command in the background.
@@ -368,10 +415,10 @@ export class Commands {
    *
    * @returns `CommandHandle` handle to interact with the running command.
    */
-  async run(
+  async run<RetainOutput extends boolean | undefined = undefined>(
     cmd: string,
-    opts: CommandStartOpts & { background: true }
-  ): Promise<CommandHandle>
+    opts: CommandStartOpts & { background: true; retainOutput?: RetainOutput }
+  ): Promise<CommandHandle<CommandOutput<RetainOutput>>>
 
   // NOTE - The following overload seems redundant, but it's required to make the type inference work correctly.
 
@@ -385,14 +432,22 @@ export class Commands {
    *
    * @returns Either a `CommandHandle` or a `CommandResult` (depending on `opts.background`).
    */
+  async run<RetainOutput extends boolean | undefined = undefined>(
+    cmd: string,
+    opts?: CommandStartOpts & {
+      background?: boolean
+      retainOutput?: RetainOutput
+    }
+  ): Promise<
+    | CommandHandle<CommandOutput<RetainOutput>>
+    | CommandResult<CommandOutput<RetainOutput>>
+  >
   async run(
     cmd: string,
     opts?: CommandStartOpts & { background?: boolean }
-  ): Promise<CommandHandle | CommandResult>
-  async run(
-    cmd: string,
-    opts?: CommandStartOpts & { background?: boolean }
-  ): Promise<CommandHandle | CommandResult> {
+  ): Promise<
+    CommandHandle<string | undefined> | CommandResult<string | undefined>
+  > {
     const proc = await this.start(cmd, opts)
 
     return opts?.background ? proc : proc.wait()
@@ -401,18 +456,7 @@ export class Commands {
   private async start(
     cmd: string,
     opts?: CommandStartOpts
-  ): Promise<CommandHandle> {
-    const requestTimeoutMs =
-      opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
-
-    const controller = new AbortController()
-
-    const reqTimeout = requestTimeoutMs
-      ? setTimeout(() => {
-          controller.abort()
-        }, requestTimeoutMs)
-      : undefined
-
+  ): Promise<CommandHandle<string | undefined>> {
     if (
       opts?.stdin === false &&
       compareVersions(this.envdVersion, ENVD_COMMANDS_STDIN) < 0
@@ -422,13 +466,29 @@ export class Commands {
       )
     }
 
+    const shellOpt = opts?.shell ?? DEFAULT_SHELL
+    if (!Array.isArray(shellOpt) || !shellOpt[0]) {
+      throw new InvalidArgumentError(
+        "`shell` must start with the executable, e.g. `['/bin/sh', '-c']`. Omit `shell` to use the default `['/bin/bash', '-l', '-c']`."
+      )
+    }
+    const [shell, ...shellArgs] = shellOpt
+
+    const requestTimeoutMs =
+      opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
+
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
+
     const events = this.rpc.start(
       {
         process: {
-          cmd: '/bin/bash',
+          cmd: shell,
           cwd: opts?.cwd,
           envs: opts?.envs,
-          args: ['-l', '-c', cmd],
+          args: [...shellArgs, cmd],
         },
         stdin: opts?.stdin || false,
       },
@@ -442,22 +502,40 @@ export class Commands {
       }
     )
 
+    return this.createHandle<string | undefined>(
+      events,
+      clearStartTimeout,
+      cleanup,
+      opts
+    )
+  }
+
+  private async createHandle<Output extends string | undefined>(
+    events: AsyncIterable<StartResponse | ConnectResponse>,
+    clearStartTimeout: () => void,
+    cleanup: () => void,
+    opts?: Pick<CommandStartOpts, 'onStdout' | 'onStderr' | 'retainOutput'>
+  ): Promise<CommandHandle<Output>> {
     try {
       const pid = await handleProcessStartEvent(events)
+      clearStartTimeout()
 
-      clearTimeout(reqTimeout)
-
-      return new CommandHandle(
+      return new CommandHandle<Output>(
         pid,
-        () => controller.abort(),
+        cleanup,
         () => this.kill(pid),
         events,
         opts?.onStdout,
         opts?.onStderr,
-        undefined
+        undefined,
+        (data, stdinOpts) => this.sendStdin(pid, data, stdinOpts),
+        (stdinOpts) => this.closeStdin(pid, stdinOpts),
+        this.checkHealth,
+        opts?.retainOutput ?? true
       )
     } catch (err) {
-      throw handleRpcError(err)
+      cleanup()
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 }

@@ -45,10 +45,22 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
         return response_500
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
+    if response.status_code == 504:
+        response_504 = Error.from_dict(response.json())
+
+        return response_504
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -71,7 +83,10 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: NewSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Create a sandbox from the template
+    """Create sandbox
+
+     Create a sandbox from the template. All system communication with the sandbox is secured. Use POST
+    /v2/sandboxes instead.
 
     Args:
         body (NewSandbox):
@@ -100,7 +115,10 @@ def sync(
     client: AuthenticatedClient,
     body: NewSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Create a sandbox from the template
+    """Create sandbox
+
+     Create a sandbox from the template. All system communication with the sandbox is secured. Use POST
+    /v2/sandboxes instead.
 
     Args:
         body (NewSandbox):
@@ -124,7 +142,10 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: NewSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Create a sandbox from the template
+    """Create sandbox
+
+     Create a sandbox from the template. All system communication with the sandbox is secured. Use POST
+    /v2/sandboxes instead.
 
     Args:
         body (NewSandbox):
@@ -151,7 +172,10 @@ async def asyncio(
     client: AuthenticatedClient,
     body: NewSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Create a sandbox from the template
+    """Create sandbox
+
+     Create a sandbox from the template. All system communication with the sandbox is secured. Use POST
+    /v2/sandboxes instead.
 
     Args:
         body (NewSandbox):

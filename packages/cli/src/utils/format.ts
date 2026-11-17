@@ -6,44 +6,31 @@ import * as boxen from 'boxen'
 import { cwdRelative } from './filesystem'
 import { UserConfig } from '../user'
 
-export const primaryColor = '#FFB766'
+const primaryColor = '#FFB766'
 
 export function asFormattedConfig(config: UserConfig) {
-  const email = asBold(config.email)
-  const team = config.teamName
-    ? asBold(config.teamName)
-    : asRed('Log out and log in to get team name')
-  const teamId = asBold(config.teamId)
-  return `You are logged in as ${email},\nSelected team: ${team} (${teamId})`
+  const email = asBold(config.identity.email)
+  const project = config.projectName
+    ? asBold(config.projectName)
+    : asRed('Log out and log in to get project name')
+  const projectId = asBold(config.projectId)
+  return `You are logged in as ${email},\nSelected project: ${project} (${projectId})`
 }
 
-export function asFormattedTeam(
-  team: e2b.components['schemas']['Team'],
-  selected: string
-) {
-  const name = asBold(team.name)
-  const id = asBold(team.teamID)
-  const isSelected =
-    team.teamID == selected ? asPrimary(' (currently selected team)') : ''
-  return `${name} (${id})${isSelected}`
+export type SandboxTemplateRef = Pick<
+  e2b.components['schemas']['Template'],
+  'templateID'
+> & {
+  aliases?: e2b.components['schemas']['Template']['aliases']
 }
 
-export function asFormattedSandboxTemplate(
-  template: Pick<e2b.components['schemas']['Template'], 'templateID'> & {
-    aliases?: e2b.components['schemas']['Template']['aliases']
-  },
-  configLocalPath?: string
-) {
+export function asFormattedSandboxTemplate(template: SandboxTemplateRef) {
   const aliases = listAliases(template.aliases)
 
   const name = aliases ? asBold(aliases) : ''
-  const configPath = configLocalPath
-    ? asDim(' <-> ') + asLocalRelative(configLocalPath)
-    : ''
-
   const id = `${template.templateID} `
 
-  return `${id}${name}${configPath}`.trim()
+  return `${id}${name}`.trim()
 }
 
 export function asRed(text: string) {
@@ -54,10 +41,6 @@ export function asFormattedError(text: string | undefined, err?: any) {
   return chalk.default.redBright(
     `${text ? `${text} \n` : ''}${err ? err.stack : ''}\n`
   )
-}
-
-export function asDim(content?: string) {
-  return chalk.default.dim(content)
 }
 
 export function asBold(content: string) {
@@ -72,10 +55,6 @@ export function asTimestamp(content: string) {
   return chalk.default.blue(content)
 }
 
-export function asSandboxTemplate(pathInTemplate?: string) {
-  return chalk.default.green(pathInTemplate)
-}
-
 export function asLocal(pathInLocal?: string) {
   return chalk.default.blue(pathInLocal)
 }
@@ -83,14 +62,6 @@ export function asLocal(pathInLocal?: string) {
 export function asLocalRelative(absolutePathInLocal?: string) {
   if (!absolutePathInLocal) return ''
   return asLocal('./' + cwdRelative(absolutePathInLocal))
-}
-
-export function asBuildLogs(content: string) {
-  return chalk.default.blueBright(content)
-}
-
-export function asHeadline(content: string) {
-  return chalk.default.underline(asPrimary(asBold(content)))
 }
 
 export function withUnderline(content: string) {
@@ -113,7 +84,7 @@ export function asPython(code: string) {
   return highlight.default(code, { language: 'python', ignoreIllegals: true })
 }
 
-export const borderStyle = {
+const borderStyle = {
   topLeft: '',
   topRight: '',
   bottomLeft: '',
