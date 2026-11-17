@@ -1,28 +1,32 @@
-import {
-  Code,
-  ConnectError,
-  createClient,
-  Client,
-  Transport,
-} from '@connectrpc/connect'
+import { createClient, Client, Transport } from '@connectrpc/connect'
 
-import {
-  Signal,
-  Process as ProcessService,
-} from '../../envd/process/process_pb'
+import { Process as ProcessService } from '../../envd/process/process_pb'
 import {
   ConnectionConfig,
   ConnectionOpts,
   Username,
   KEEPALIVE_PING_HEADER,
   KEEPALIVE_PING_INTERVAL_SEC,
+  setupRequestController,
 } from '../../connectionConfig'
 import { CommandHandle } from './commandHandle'
-import { authenticationHeader, handleRpcError } from '../../envd/rpc'
-import { handleProcessStartEvent } from '../../envd/api'
+import { CommandInputHandle, CommandStreamInputOpts } from './inputHandle'
+import {
+  authenticationHeader,
+  handleRpcErrorWithHealthCheck,
+  killProcess,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
+import {
+  checkSandboxHealth,
+  EnvdApiClient,
+  handleProcessStartEvent,
+} from '../../envd/api'
 
-export interface PtyCreateOpts
-  extends Pick<ConnectionOpts, 'requestTimeoutMs'> {
+export interface PtyCreateOpts extends Pick<
+  ConnectionOpts,
+  'requestTimeoutMs' | 'signal'
+> {
   /**
    * Number of columns for the PTY.
    */
@@ -65,26 +69,29 @@ export interface PtyCreateOpts
  * Options for connecting to a command.
  */
 export type PtyConnectOpts = Pick<PtyCreateOpts, 'onData' | 'timeoutMs'> &
-  Pick<ConnectionOpts, 'requestTimeoutMs'>
+  Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>
 
 /**
  * Module for interacting with PTYs (pseudo-terminals) in the sandbox.
  */
 export class Pty {
   private readonly rpc: Client<typeof ProcessService>
+  private readonly streamingRpc: Client<typeof ProcessService>
   private readonly envdVersion: string
+  private readonly checkHealth: SandboxHealthCheck
 
   private readonly defaultPtyConnectionTimeout = 60_000 // 60 seconds
 
   constructor(
     private readonly transport: Transport,
+    private readonly envdApi: EnvdApiClient,
     private readonly connectionConfig: ConnectionConfig,
-    metadata: {
-      version: string
-    }
+    streamingTransport: Transport
   ) {
     this.rpc = createClient(ProcessService, this.transport)
-    this.envdVersion = metadata.version
+    this.streamingRpc = createClient(ProcessService, streamingTransport)
+    this.envdVersion = envdApi.version
+    this.checkHealth = () => checkSandboxHealth(this.envdApi)
   }
 
   /**
@@ -97,15 +104,15 @@ export class Pty {
   async create(opts: PtyCreateOpts) {
     const requestTimeoutMs =
       opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
-    const envs = opts?.envs ?? {}
+    const envs = { ...(opts?.envs ?? {}) }
     envs.TERM = envs.TERM ?? 'xterm-256color'
     envs.LANG = envs.LANG ?? 'C.UTF-8'
     envs.LC_ALL = envs.LC_ALL ?? 'C.UTF-8'
-    const controller = new AbortController()
 
-    const reqTimeout = setTimeout(() => {
-      controller.abort()
-    }, requestTimeoutMs)
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
 
     const events = this.rpc.start(
       {
@@ -134,20 +141,23 @@ export class Pty {
 
     try {
       const pid = await handleProcessStartEvent(events)
-
-      clearTimeout(reqTimeout)
+      clearStartTimeout()
 
       return new CommandHandle(
         pid,
-        () => controller.abort(),
+        cleanup,
         () => this.kill(pid),
         events,
         undefined,
         undefined,
-        opts.onData
+        opts.onData,
+        undefined,
+        undefined,
+        this.checkHealth
       )
     } catch (err) {
-      throw handleRpcError(err)
+      cleanup()
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -163,13 +173,10 @@ export class Pty {
     const requestTimeoutMs =
       opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
 
-    const controller = new AbortController()
-
-    const reqTimeout = requestTimeoutMs
-      ? setTimeout(() => {
-          controller.abort()
-        }, requestTimeoutMs)
-      : undefined
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
 
     const events = this.rpc.connect(
       {
@@ -191,20 +198,23 @@ export class Pty {
 
     try {
       const pid = await handleProcessStartEvent(events)
-
-      clearTimeout(reqTimeout)
+      clearStartTimeout()
 
       return new CommandHandle(
         pid,
-        () => controller.abort(),
+        cleanup,
         () => this.kill(pid),
         events,
         undefined,
         undefined,
-        opts?.onData
+        opts?.onData,
+        undefined,
+        undefined,
+        this.checkHealth
       )
     } catch (err) {
-      throw handleRpcError(err)
+      cleanup()
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -218,7 +228,7 @@ export class Pty {
   async sendInput(
     pid: number,
     data: Uint8Array,
-    opts?: Pick<ConnectionOpts, 'requestTimeoutMs'>
+    opts?: Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>
   ): Promise<void> {
     try {
       await this.rpc.sendInput(
@@ -237,12 +247,51 @@ export class Pty {
           },
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
+  }
+
+  /**
+   * Open a persistent input stream to a PTY.
+   *
+   * Input sent through this stream is ordered relative to other `send` calls.
+   * Use this instead of {@link Pty.sendInput} when ordering matters; each
+   * `sendInput` call is a separate request. The stream sends keepalive messages
+   * while idle.
+   *
+   * In browsers, this requires fetch request-body streaming support (Chromium
+   * over HTTP/2).
+   *
+   * @param pid Process ID of the PTY.
+   * @param opts Optional stream timeout and abort signal. `timeoutMs` defaults to `STREAM_INPUT_TIMEOUT_MS` (60_000 milliseconds).
+   * @returns A handle whose `send()` method queues input in order and whose `close()` method ends the stream and waits for envd.
+   * @throws {NotFoundError} If the PTY does not exist, surfaced from `send()` or `close()`.
+   * @throws {TimeoutError} If the stream timeout expires, surfaced from `send()` or `close()`.
+   * @example
+   * ```ts
+   * const input = sandbox.pty.streamInput(pid)
+   * await input.send('echo hello\n')
+   * await input.close()
+   * ```
+   */
+  streamInput(
+    pid: number,
+    opts: CommandStreamInputOpts = {}
+  ): CommandInputHandle {
+    return new CommandInputHandle(
+      this.streamingRpc,
+      pid,
+      'pty',
+      opts,
+      this.checkHealth
+    )
   }
 
   /**
@@ -259,7 +308,7 @@ export class Pty {
       cols: number
       rows: number
     },
-    opts?: Pick<ConnectionOpts, 'requestTimeoutMs'>
+    opts?: Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>
   ): Promise<void> {
     try {
       await this.rpc.update(
@@ -275,11 +324,14 @@ export class Pty {
           },
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -294,33 +346,13 @@ export class Pty {
    */
   async kill(
     pid: number,
-    opts?: Pick<ConnectionOpts, 'requestTimeoutMs'>
+    opts?: Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>
   ): Promise<boolean> {
-    try {
-      await this.rpc.sendSignal(
-        {
-          process: {
-            selector: {
-              case: 'pid',
-              value: pid,
-            },
-          },
-          signal: Signal.SIGKILL,
-        },
-        {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
-        }
-      )
-
-      return true
-    } catch (err) {
-      if (err instanceof ConnectError) {
-        if (err.code === Code.NotFound) {
-          return false
-        }
-      }
-
-      throw handleRpcError(err)
-    }
+    return killProcess(
+      this.rpc,
+      pid,
+      this.connectionConfig.getSignal(opts?.requestTimeoutMs, opts?.signal),
+      this.checkHealth
+    )
   }
 }

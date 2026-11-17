@@ -32,6 +32,7 @@ from .api import (
 from .connection_config import (
     ApiParams,
     ConnectionConfig,
+    HttpVersion,
     ProxyTypes,
     Username,
 )
@@ -43,15 +44,23 @@ from .exceptions import (
     GitUpstreamException,
     BuildException,
     FileUploadException,
+    GuestUnresponsiveException,
     InvalidArgumentException,
     NotEnoughSpaceException,
     NotFoundException,
     RateLimitException,
+    ServiceBusyException,
     SandboxException,
     SandboxNotFoundException,
+    SandboxNotRunningException,
+    SandboxUnreachableException,
     TemplateException,
     TimeoutException,
     VolumeException,
+    VolumeNotFoundException,
+    VolumePathNotFoundException,
+    SecretException,
+    SecretNotFoundException,
 )
 from .sandbox.commands.command_handle import (
     CommandExitException,
@@ -62,12 +71,18 @@ from .sandbox.commands.command_handle import (
     Stdout,
 )
 from .sandbox.commands.main import ProcessInfo
-from .sandbox.filesystem.filesystem import EntryInfo, FileType, WriteInfo
+from .sandbox.filesystem.filesystem import (
+    AsyncWriteData,
+    EntryInfo,
+    FileType,
+    WriteData,
+    WriteInfo,
+)
 from .sandbox.filesystem.watch_handle import (
     FilesystemEvent,
     FilesystemEventType,
 )
-from .sandbox._git import GitBranches, GitFileStatus, GitStatus
+from .sandbox._git import GitBranches, GitFileStatus, GitResetMode, GitStatus
 from .sandbox_sync.git import Git
 from .sandbox.network import ALL_TRAFFIC
 from .sandbox.signature import get_signature
@@ -75,20 +90,49 @@ from .sandbox.sandbox_api import (
     GitHubMcpServer,
     GitHubMcpServerConfig,
     McpServer,
+    SandboxEgressProxyInfo,
+    SandboxEgressProxyOpts,
+    SandboxEgressProxyTLSInfo,
+    SandboxEgressProxyTLSOpts,
+    SandboxIamOpts,
+    SandboxIamToken,
+    SandboxIamTokenType,
     SandboxInfo,
     SandboxInfoLifecycle,
     SandboxMetrics,
     SandboxLifecycle,
+    SandboxOnTimeout,
+    SandboxNetworkInfo,
     SandboxNetworkOpts,
+    SandboxNetworkRule,
+    SandboxNetworkRuleInfo,
+    SandboxNetworkRules,
+    SandboxNetworkSelector,
+    SandboxNetworkSelectorContext,
+    SandboxNetworkTransform,
+    SandboxNetworkTransformContext,
+    SandboxNetworkTransformResolver,
+    SandboxNetworkUpdate,
+    SandboxOnResume,
+    SandboxListOrder,
     SandboxQuery,
     SandboxState,
     SnapshotInfo,
+    SnapshotMode,
 )
 from .sandbox_async.commands.command_handle import AsyncCommandHandle
+from .sandbox_async.commands.command_input_handle import AsyncCommandInputHandle
 from .sandbox_async.filesystem.watch_handle import AsyncWatchHandle
 from .sandbox_async.main import AsyncSandbox
 from .sandbox_async.paginator import AsyncSandboxPaginator, AsyncSnapshotPaginator
 from .sandbox_async.utils import OutputHandler
+from .secret import (
+    AsyncSecret,
+    AsyncSecretPaginator,
+    Secret,
+    SecretInfo,
+    SecretPaginator,
+)
 from .sandbox_sync.commands.command_handle import CommandHandle
 from .sandbox_sync.filesystem.watch_handle import WatchHandle
 from .sandbox_sync.main import Sandbox
@@ -100,6 +144,7 @@ from .template.logger import (
     LogEntryStart,
     default_build_logger,
 )
+from .template.dockerfile_parser import DockerfileSyntaxError
 from .template.main import TemplateBase, TemplateClass
 from .template.readycmd import (
     ReadyCmd,
@@ -115,14 +160,18 @@ from .template.types import (
     CopyItem,
     TemplateBuildStatus,
     TemplateBuildStatusResponse,
+    TemplateInfo,
     TemplateTag,
     TemplateTagInfo,
 )
 from .template_async.main import AsyncTemplate
+from .template_async.paginator import AsyncTemplatePaginator
 from .template_sync.main import Template
+from .template_sync.paginator import TemplatePaginator
 
 from .volume.volume_sync import Volume
 from .volume.volume_async import AsyncVolume
+from .client import E2B, E2BClientParams
 from .volume.types import (
     VolumeInfo,
     VolumeAndToken,
@@ -131,43 +180,56 @@ from .volume.types import (
 )
 
 __all__ = [
+    # Client
+    "E2B",
+    "E2BClientParams",
     # API
     "ApiClient",
     "client",
     # Connection config
     "ConnectionConfig",
     "VolumeConnectionConfig",
+    "HttpVersion",
     "ProxyTypes",
     "ApiParams",
     "VolumeApiParams",
     "Username",
     # Exceptions
     "SandboxException",
+    "ServiceBusyException",
     "TimeoutException",
     "NotFoundException",
     "FileNotFoundException",
     "SandboxNotFoundException",
+    "SandboxNotRunningException",
+    "SandboxUnreachableException",
     "AuthenticationException",
     "GitAuthException",
     "GitUpstreamException",
     "InvalidArgumentException",
     "NotEnoughSpaceException",
     "TemplateException",
+    "DockerfileSyntaxError",
     "BuildException",
     "FileUploadException",
+    "GuestUnresponsiveException",
     "RateLimitException",
     "VolumeException",
+    "VolumeNotFoundException",
+    "VolumePathNotFoundException",
     # Sandbox API
     "SandboxInfo",
     "SandboxInfoLifecycle",
     "SandboxMetrics",
     "ProcessInfo",
+    "SandboxListOrder",
     "SandboxQuery",
     "SandboxState",
     "SandboxMetrics",
     "GitStatus",
     "GitBranches",
     "GitFileStatus",
+    "GitResetMode",
     # Command handle
     "CommandResult",
     "Stderr",
@@ -180,13 +242,43 @@ __all__ = [
     "FilesystemEventType",
     "EntryInfo",
     "WriteInfo",
+    "WriteData",
+    "AsyncWriteData",
     "FileType",
     # Network
+    "SandboxEgressProxyOpts",
+    "SandboxEgressProxyInfo",
+    "SandboxEgressProxyTLSOpts",
+    "SandboxEgressProxyTLSInfo",
     "SandboxNetworkOpts",
+    "SandboxNetworkInfo",
+    "SandboxNetworkSelector",
+    "SandboxNetworkSelectorContext",
+    "SandboxNetworkRule",
+    "SandboxNetworkRuleInfo",
+    "SandboxNetworkRules",
+    "SandboxNetworkTransform",
+    "SandboxNetworkTransformContext",
+    "SandboxNetworkTransformResolver",
+    "SandboxNetworkUpdate",
     "SandboxLifecycle",
+    "SandboxOnTimeout",
+    "SandboxOnResume",
     "ALL_TRAFFIC",
+    # IAM
+    "SandboxIamOpts",
+    "SandboxIamToken",
+    "SandboxIamTokenType",
+    "Secret",
+    "AsyncSecret",
+    "SecretInfo",
+    "SecretPaginator",
+    "AsyncSecretPaginator",
+    "SecretException",
+    "SecretNotFoundException",
     # Snapshot
     "SnapshotInfo",
+    "SnapshotMode",
     "SnapshotPaginator",
     "AsyncSnapshotPaginator",
     # Signature
@@ -202,6 +294,7 @@ __all__ = [
     "AsyncSandbox",
     "AsyncWatchHandle",
     "AsyncCommandHandle",
+    "AsyncCommandInputHandle",
     # Template
     "Template",
     "AsyncTemplate",
@@ -212,6 +305,9 @@ __all__ = [
     "BuildStatusReason",
     "TemplateBuildStatus",
     "TemplateBuildStatusResponse",
+    "TemplateInfo",
+    "TemplatePaginator",
+    "AsyncTemplatePaginator",
     "TemplateTag",
     "TemplateTagInfo",
     "ReadyCmd",

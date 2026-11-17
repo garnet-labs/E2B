@@ -1,8 +1,13 @@
-import { ApiClient, handleApiError, paths, components } from '../api'
-import { dynamicImport, stripAnsi } from '../utils'
+import fs from 'node:fs'
+import stream from 'node:stream'
+
+import { ApiClient, handleApiError, components } from '../api'
+import { buildRequestSignal } from '../connectionConfig'
+import { loadUndici } from '../undici'
 import { BuildError, FileUploadError, TemplateError } from '../errors'
+import { FILE_UPLOAD_TIMEOUT_MS } from './consts'
 import { LogEntry } from './logger'
-import { getBuildStepIndex, tarFileStreamUpload } from './utils'
+import { getBuildStepIndex, spoolTarArchive } from './utils'
 import {
   BuildStatusReason,
   TemplateBuildStatus,
@@ -14,8 +19,10 @@ import {
 type RequestBuildInput = {
   name: string
   tags?: string[]
-  cpuCount: number
-  memoryMB: number
+  cpuCount?: number
+  maxCpuCount?: number
+  memoryMB?: number
+  minFreeDiskMb?: number
 }
 
 type GetFileUploadLinkInput = {
@@ -39,23 +46,32 @@ type CheckAliasExistsInput = {
   alias: string
 }
 
-type ApiBuildStatusResponse =
-  paths['/templates/{templateID}/builds/{buildID}/status']['get']['responses']['200']['content']['application/json']
+type ApiBuildStatusResponse = components['schemas']['TemplateBuildInfo']
 
-export type TriggerBuildTemplate =
-  paths['/v2/templates/{templateID}/builds/{buildID}']['post']['requestBody']['content']['application/json']
+export type TriggerBuildTemplate = components['schemas']['TemplateBuildStartV2']
 
 export async function requestBuild(
   client: ApiClient,
-  { name, tags, cpuCount, memoryMB }: RequestBuildInput
+  {
+    name,
+    tags,
+    cpuCount,
+    maxCpuCount,
+    memoryMB,
+    minFreeDiskMb,
+  }: RequestBuildInput,
+  signal?: AbortSignal
 ) {
   const requestBuildRes = await client.api.POST('/v3/templates', {
     body: {
       name,
       tags,
       cpuCount,
+      maxCpuCount,
       memoryMB,
+      minFreeDiskMb,
     },
+    signal,
   })
 
   const error = handleApiError(requestBuildRes, BuildError)
@@ -73,7 +89,8 @@ export async function requestBuild(
 export async function getFileUploadLink(
   client: ApiClient,
   { templateID, filesHash }: GetFileUploadLinkInput,
-  stackTrace?: string
+  stackTrace?: string,
+  signal?: AbortSignal
 ) {
   const fileUploadLinkRes = await client.api.GET(
     '/templates/{templateID}/files/{hash}',
@@ -84,6 +101,7 @@ export async function getFileUploadLink(
           hash: filesHash,
         },
       },
+      signal,
     }
   )
 
@@ -104,41 +122,50 @@ export async function uploadFile(
     fileName: string
     fileContextPath: string
     url: string
+    headers?: Record<string, string>
     ignorePatterns: string[]
     resolveSymlinks: boolean
+    gzip: boolean
   },
-  stackTrace: string | undefined
+  stackTrace: string | undefined,
+  // Uploads (PUT to S3 presigned URL) can take a long time for large
+  // archives — the 60s API default would break them, so we use a 1-hour
+  // upload default (`FILE_UPLOAD_TIMEOUT_MS`) when `requestTimeoutMs` is
+  // not supplied. Pass `requestTimeoutMs` (or an `AbortSignal.timeout(ms)`
+  // via `signal`) to override.
+  abortOpts?: { signal?: AbortSignal; requestTimeoutMs?: number }
 ) {
-  const { fileName, url, fileContextPath, ignorePatterns, resolveSymlinks } =
-    options
+  const {
+    fileName,
+    url,
+    headers,
+    fileContextPath,
+    ignorePatterns,
+    resolveSymlinks,
+    gzip,
+  } = options
+  // Spool the archive to a temporary file and stream it from disk instead of
+  // buffering it in memory. S3 presigned PUT URLs reject Transfer-Encoding:
+  // chunked with 501 NotImplemented (see e2b-dev/e2b#1243), so the upload
+  // must carry an exact Content-Length. The Python SDK takes the same
+  // approach (build_api.py:upload_file).
+  let cleanup: (() => Promise<void>) | undefined
   try {
-    const uploadStream = await tarFileStreamUpload(
+    const tar = await spoolTarArchive(
       fileName,
       fileContextPath,
       ignorePatterns,
-      resolveSymlinks
+      resolveSymlinks,
+      gzip
+    )
+    cleanup = tar.cleanup
+
+    const signal = buildRequestSignal(
+      abortOpts?.requestTimeoutMs ?? FILE_UPLOAD_TIMEOUT_MS,
+      abortOpts?.signal
     )
 
-    // Buffer the archive before uploading so fetch sets Content-Length.
-    // S3 presigned PUT URLs reject Transfer-Encoding: chunked with 501
-    // NotImplemented, which is what Node's fetch falls back to when the
-    // body is a Readable without a known length. See e2b-dev/e2b#1243.
-    // The Python SDK takes the same approach (build_api.py:upload_file).
-    // Dynamically import so the browser bundle doesn't pull in node:stream.
-    // tar's Pack extends Minipass and is iterable as AsyncIterable<Buffer> at
-    // runtime, but the cli's tsconfig (preserveSymlinks) doesn't surface that
-    // through the type chain — cast via unknown.
-    const { buffer } = await dynamicImport<
-      typeof import('node:stream/consumers')
-    >('node:stream/consumers')
-    const uploadBody = await buffer(
-      uploadStream as unknown as AsyncIterable<Buffer>
-    )
-
-    const res = await fetch(url, {
-      method: 'PUT',
-      body: uploadBody,
-    })
+    const res = await putFileStream(url, tar.path, tar.size, signal, headers)
 
     if (!res.ok) {
       throw new FileUploadError(
@@ -151,12 +178,50 @@ export async function uploadFile(
       throw error
     }
     throw new FileUploadError(`Failed to upload file: ${error}`, stackTrace)
+  } finally {
+    await cleanup?.()
   }
+}
+
+async function putFileStream(
+  url: string,
+  filePath: string,
+  size: number,
+  signal: AbortSignal | undefined,
+  headers?: Record<string, string>
+): Promise<{ ok: boolean; statusText: string }> {
+  // Prefer undici's fetch: it honors the explicit Content-Length on stream
+  // bodies on every runtime, while Deno's native fetch ignores the header and
+  // falls back to chunked. Where undici doesn't load (e.g. bundled apps),
+  // the global fetch is used — Node's and Bun's native fetch also honor
+  // Content-Length on stream bodies.
+  const undici = await loadUndici()
+  const fetchImpl = (undici?.fetch as typeof fetch | undefined) ?? fetch
+
+  return await fetchImpl(url, {
+    method: 'PUT',
+    body: stream.Readable.toWeb(
+      fs.createReadStream(filePath)
+    ) as ReadableStream,
+    // API-returned headers applied as given (Azure needs x-ms-blob-type, which a SAS cannot carry); Content-Length stays ours, dropped case-insensitively since fetch header names are not case-sensitive.
+    headers: {
+      ...Object.fromEntries(
+        Object.entries(headers ?? {}).filter(
+          ([name]) => name.toLowerCase() !== 'content-length'
+        )
+      ),
+      'Content-Length': size.toString(),
+    },
+    // Streaming request bodies require half-duplex mode.
+    duplex: 'half',
+    signal,
+  } as RequestInit)
 }
 
 export async function triggerBuild(
   client: ApiClient,
-  { templateID, buildID, template }: TriggerBuildInput
+  { templateID, buildID, template }: TriggerBuildInput,
+  signal?: AbortSignal
 ) {
   const triggerBuildRes = await client.api.POST(
     '/v2/templates/{templateID}/builds/{buildID}',
@@ -168,6 +233,7 @@ export async function triggerBuild(
         },
       },
       body: template,
+      signal,
     }
   )
 
@@ -198,7 +264,8 @@ function mapBuildStatusReason(
 
 export async function getBuildStatus(
   client: ApiClient,
-  { templateID, buildID, logsOffset }: GetBuildStatusInput
+  { templateID, buildID, logsOffset }: GetBuildStatusInput,
+  signal?: AbortSignal
 ): Promise<TemplateBuildStatusResponse> {
   const buildStatusRes = await client.api.GET(
     '/templates/{templateID}/builds/{buildID}/status',
@@ -212,6 +279,7 @@ export async function getBuildStatus(
           logsOffset,
         },
       },
+      signal,
     }
   )
 
@@ -236,7 +304,8 @@ export async function getBuildStatus(
 
 export async function checkAliasExists(
   client: ApiClient,
-  { alias }: CheckAliasExistsInput
+  { alias }: CheckAliasExistsInput,
+  signal?: AbortSignal
 ): Promise<boolean> {
   const aliasRes = await client.api.GET('/templates/aliases/{alias}', {
     params: {
@@ -244,6 +313,7 @@ export async function checkAliasExists(
         alias,
       },
     },
+    signal,
   })
 
   // If we get a NotFound, the alias doesn't exist
@@ -274,45 +344,60 @@ export async function waitForBuildFinish(
     onBuildLogs,
     logsRefreshFrequency,
     stackTraces,
+    signal,
+    requestTimeoutMs,
   }: {
     templateID: string
     buildID: string
     onBuildLogs?: (logEntry: LogEntry) => void
     logsRefreshFrequency: number
     stackTraces: (string | undefined)[]
+    signal?: AbortSignal
+    requestTimeoutMs?: number
   }
 ): Promise<void> {
   let logsOffset = 0
   let status: TemplateBuildStatus = 'building'
 
-  while (status === 'building' || status === 'waiting') {
-    const buildStatus = await getBuildStatus(client, {
-      templateID,
-      buildID,
-      logsOffset,
-    })
+  const pollStatus = async (): Promise<TemplateBuildStatusResponse> => {
+    const buildStatus = await getBuildStatus(
+      client,
+      {
+        templateID,
+        buildID,
+        logsOffset,
+      },
+      buildRequestSignal(requestTimeoutMs, signal)
+    )
 
     logsOffset += buildStatus.logEntries.length
+    buildStatus.logEntries.forEach((logEntry) => onBuildLogs?.(logEntry))
 
-    buildStatus.logEntries.forEach((logEntry) =>
-      onBuildLogs?.(
-        new LogEntry(
-          logEntry.timestamp,
-          logEntry.level,
-          stripAnsi(logEntry.message)
-        )
-      )
-    )
+    return buildStatus
+  }
+
+  while (status === 'building' || status === 'waiting') {
+    signal?.throwIfAborted()
+
+    const buildStatus = await pollStatus()
 
     status = buildStatus.status
     switch (status) {
-      case 'ready': {
-        return
-      }
-      case 'waiting': {
-        break
-      }
+      case 'ready':
       case 'error': {
+        // The status endpoint returns at most 100 log entries per call, so
+        // the terminal response may not include the last logs — keep
+        // fetching until they are drained.
+        let tailStatus = buildStatus
+        while (tailStatus.logEntries.length > 0) {
+          signal?.throwIfAborted()
+          tailStatus = await pollStatus()
+        }
+
+        if (status === 'ready') {
+          return
+        }
+
         let stackError: string | undefined
         if (buildStatus.reason?.step !== undefined) {
           const step = getBuildStepIndex(
@@ -327,9 +412,13 @@ export async function waitForBuildFinish(
           stackError
         )
       }
+      case 'waiting': {
+        break
+      }
     }
 
-    // Wait for a short period before checking the status again
+    // Wait for a short period before checking the status again. Abort is
+    // observed on the next iteration via `signal?.throwIfAborted()`.
     await new Promise((resolve) => setTimeout(resolve, logsRefreshFrequency))
   }
 
@@ -338,10 +427,12 @@ export async function waitForBuildFinish(
 
 export async function assignTags(
   client: ApiClient,
-  { targetName, tags }: { targetName: string; tags: string[] }
+  { targetName, tags }: { targetName: string; tags: string[] },
+  signal?: AbortSignal
 ): Promise<TemplateTagInfo> {
   const res = await client.api.POST('/templates/tags', {
     body: { target: targetName, tags },
+    signal,
   })
 
   const error = handleApiError(res, TemplateError)
@@ -361,10 +452,12 @@ export async function assignTags(
 
 export async function removeTags(
   client: ApiClient,
-  { name, tags }: { name: string; tags: string[] }
+  { name, tags }: { name: string; tags: string[] },
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await client.api.DELETE('/templates/tags', {
     body: { name, tags },
+    signal,
   })
 
   const error = handleApiError(res, TemplateError)
@@ -375,7 +468,8 @@ export async function removeTags(
 
 export async function getTemplateTags(
   client: ApiClient,
-  { templateID }: { templateID: string }
+  { templateID }: { templateID: string },
+  signal?: AbortSignal
 ): Promise<TemplateTag[]> {
   const res = await client.api.GET('/templates/{templateID}/tags', {
     params: {
@@ -383,6 +477,7 @@ export async function getTemplateTags(
         templateID,
       },
     },
+    signal,
   })
 
   const error = handleApiError(res, TemplateError)
@@ -399,4 +494,30 @@ export async function getTemplateTags(
     buildId: item.buildID,
     createdAt: new Date(item.createdAt),
   }))
+}
+
+export async function deleteTemplate(
+  client: ApiClient,
+  { templateID }: { templateID: string },
+  signal?: AbortSignal
+): Promise<boolean> {
+  const res = await client.api.DELETE('/templates/{templateID}', {
+    params: {
+      path: {
+        templateID,
+      },
+    },
+    signal,
+  })
+
+  if (res.response.status === 404) {
+    return false
+  }
+
+  const error = handleApiError(res, TemplateError)
+  if (error) {
+    throw error
+  }
+
+  return true
 }

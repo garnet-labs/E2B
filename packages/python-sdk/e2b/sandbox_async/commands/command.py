@@ -1,20 +1,42 @@
-from typing import Dict, List, Literal, Optional, Union, overload
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Union,
+    overload,
+)
 
-import e2b_connect
-import httpcore
+import httpx
+
+from e2b.api.client_async import get_envd_api
 from packaging.version import Version
 from e2b.connection_config import (
     ConnectionConfig,
     Username,
     KEEPALIVE_PING_HEADER,
     KEEPALIVE_PING_INTERVAL_SEC,
+    STREAM_INPUT_TIMEOUT,
 )
-from e2b.envd.process import process_connect, process_pb2
-from e2b.envd.rpc import authentication_header, handle_rpc_exception
-from e2b.envd.versions import ENVD_COMMANDS_STDIN
+from protobuf import Oneof
+
+from e2b.envd.process import process_connect, process_pb
+from e2b.envd.api import acheck_sandbox_health
+from e2b.envd.rpc import akill_process, ahandle_rpc_exception_with_health
+from e2b.envd.utils import (
+    authentication_header,
+    extract_start_pid,
+    timeout_to_ms,
+)
+from e2b.envd.client_async import as_stream, create_rpc_client, first_event
+from e2b.envd.versions import ENVD_COMMANDS_STDIN, ENVD_ENVD_CLOSE
 from e2b.exceptions import SandboxException
-from e2b.sandbox.commands.main import ProcessInfo
+from e2b.sandbox.commands.main import ProcessInfo, shell_command
 from e2b.sandbox.commands.command_handle import CommandResult
+from e2b.sandbox_async.commands.command_input_handle import AsyncCommandInputHandle
 from e2b.sandbox_async.commands.command_handle import AsyncCommandHandle, Stderr, Stdout
 from e2b.sandbox_async.utils import OutputHandler
 
@@ -28,19 +50,26 @@ class Commands:
         self,
         envd_api_url: str,
         connection_config: ConnectionConfig,
-        pool: httpcore.AsyncConnectionPool,
         envd_version: Version,
+        envd_api: httpx.AsyncClient,
     ) -> None:
         self._connection_config = connection_config
         self._envd_version = envd_version
-        self._rpc = process_connect.ProcessClient(
+        self._rpc = create_rpc_client(
+            process_connect.ProcessClient,
             envd_api_url,
-            # TODO: Fix and enable compression again — the headers compression is not solved for streaming.
-            # compressor=e2b_connect.GzipCompressor,
-            async_pool=pool,
-            json=True,
-            headers=connection_config.sandbox_headers,
+            connection_config,
         )
+        self._envd_api = envd_api
+        # The health probe run after a request failed goes without the
+        # connection retries, so a sandbox that cannot be reached is not tried
+        # all over again (see `get_transport`).
+        self._envd_health_api = get_envd_api(
+            connection_config, envd_api_url, retry_connect=False
+        )
+
+    async def _check_health(self) -> Optional[bool]:
+        return await acheck_sandbox_health(self._envd_health_api)
 
     async def list(
         self,
@@ -54,25 +83,28 @@ class Commands:
         :return: List of running commands and PTY sessions
         """
         try:
-            res = await self._rpc.alist(
-                process_pb2.ListRequest(),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+            res = await self._rpc.list(
+                process_pb.ListRequest(),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
             )
             return [
                 ProcessInfo(
                     pid=p.pid,
-                    tag=p.tag,
-                    cmd=p.config.cmd,
-                    args=list(p.config.args),
-                    envs=dict(p.config.envs),
-                    cwd=p.config.cwd,
+                    # Optional scalars: unset reads as "" — presence checks keep
+                    # them None
+                    tag=p.tag if p.has_field("tag") else None,
+                    cmd=config.cmd,
+                    args=list(config.args),
+                    envs=dict(config.envs),
+                    cwd=config.cwd if config.has_field("cwd") else None,
                 )
                 for p in res.processes
+                for config in (p.config or process_pb.ProcessConfig(),)
             ]
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def kill(
         self,
@@ -88,27 +120,17 @@ class Commands:
 
         :return: `True` if the command was killed, `False` if the command was not found
         """
-        try:
-            await self._rpc.asend_signal(
-                process_pb2.SendSignalRequest(
-                    process=process_pb2.ProcessSelector(pid=pid),
-                    signal=process_pb2.Signal.SIGNAL_SIGKILL,
-                ),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
-                ),
-            )
-            return True
-        except Exception as e:
-            if isinstance(e, e2b_connect.ConnectException):
-                if e.status == e2b_connect.Code.not_found:
-                    return False
-            raise handle_rpc_exception(e)
+        return await akill_process(
+            self._rpc,
+            pid,
+            self._connection_config.get_request_timeout(request_timeout),
+            self._check_health,
+        )
 
     async def send_stdin(
         self,
         pid: int,
-        data: str,
+        data: Union[str, bytes],
         request_timeout: Optional[float] = None,
     ) -> None:
         """
@@ -119,19 +141,78 @@ class Commands:
         :param request_timeout: Timeout for the request in **seconds**
         """
         try:
-            await self._rpc.asend_input(
-                process_pb2.SendInputRequest(
-                    process=process_pb2.ProcessSelector(pid=pid),
-                    input=process_pb2.ProcessInput(
-                        stdin=data.encode(),
+            await self._rpc.send_input(
+                process_pb.SendInputRequest(
+                    process=process_pb.ProcessSelector(selector=Oneof("pid", pid)),
+                    input=process_pb.ProcessInput(
+                        input=Oneof(
+                            "stdin", data.encode() if isinstance(data, str) else data
+                        ),
                     ),
                 ),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
+
+    def stream_input(
+        self,
+        pid: int,
+        *,
+        timeout: Optional[float] = STREAM_INPUT_TIMEOUT,
+    ) -> AsyncCommandInputHandle:
+        """Open an ordered input handle to command stdin.
+
+        :param pid: Process ID of the command.
+        :param timeout: Timeout in seconds; defaults to ``STREAM_INPUT_TIMEOUT``
+            (60 seconds). ``0`` or ``None`` disables the timeout.
+        :return: Handle for queuing ordered input with ``send()`` and ending the
+            stream with ``close()``.
+        :raises NotFoundException: If the command does not exist; surfaced by
+            the handle's ``send()`` or ``close()``.
+        :raises TimeoutException: If the stream timeout expires; surfaced by
+            the handle's ``send()`` or ``close()``.
+        """
+        return AsyncCommandInputHandle(
+            self._rpc,
+            pid,
+            "stdin",
+            timeout,
+            self._check_health,
+        )
+
+    async def close_stdin(
+        self,
+        pid: int,
+        request_timeout: Optional[float] = None,
+    ) -> None:
+        """
+        Close the command stdin.
+
+        This signals EOF to the command. The command must have been started with `stdin=True`.
+
+        :param pid Process ID of the command. You can get the list of processes using `sandbox.commands.list()`.
+        :param request_timeout: Timeout for the request in **seconds**
+        """
+        if self._envd_version < ENVD_ENVD_CLOSE:
+            raise SandboxException(
+                f"Sandbox envd version {self._envd_version} doesn't support closing stdin. "
+                f"Please rebuild your template to pick up the latest sandbox version."
+            )
+
+        try:
+            await self._rpc.close_stdin(
+                process_pb.CloseStdinRequest(
+                    process=process_pb.ProcessSelector(selector=Oneof("pid", pid)),
+                ),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
+                ),
+            )
+        except Exception as e:
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     @overload
     async def run(
@@ -146,6 +227,46 @@ class Commands:
         stdin: Optional[bool] = None,
         timeout: Optional[float] = 60,
         request_timeout: Optional[float] = None,
+        *,
+        retain_output: Literal[False],
+        shell: Optional[Sequence[str]] = None,
+    ) -> CommandResult[None]:
+        """
+        Start a new command and wait until it finishes executing.
+
+        :param cmd: Command to execute
+        :param background: **`False` if the command should be executed in the foreground**, `True` if the command should be executed in the background
+        :param envs: Environment variables used for the command
+        :param user: User to run the command as
+        :param cwd: Working directory to run the command
+        :param on_stdout: Callback for command stdout output
+        :param on_stderr: Callback for command stderr output
+        :param stdin: If `True`, the command will have a stdin stream that you can send data to using `sandbox.commands.send_stdin()`
+        :param timeout: Timeout for the command connection in **seconds**. Using `0` will not limit the command connection time
+        :param request_timeout: Timeout for opening the stream in **seconds** — the wait until envd confirms with a start event. The running stream is bounded by `timeout`
+        :param retain_output: If `False`, stdout and stderr are not accumulated in memory and are `None` on the result. Use `on_stdout`/`on_stderr` to consume the output instead
+        :param shell: Shell used to run the command, as the executable followed by its arguments. The command is passed as the last argument, e.g. `["/bin/sh", "-c"]` runs `/bin/sh -c <cmd>`. Defaults to `["/bin/bash", "-l", "-c"]`. Raises :class:`InvalidArgumentException` if `shell` is not a sequence (or is a string), is empty, or its first element is empty
+
+        :return: `CommandResult` result of the command execution
+        """
+        ...
+
+    @overload
+    async def run(
+        self,
+        cmd: str,
+        background: Union[Literal[False], None] = None,
+        envs: Optional[Dict[str, str]] = None,
+        user: Optional[Username] = None,
+        cwd: Optional[str] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        stdin: Optional[bool] = None,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        *,
+        retain_output: Literal[True] = True,
+        shell: Optional[Sequence[str]] = None,
     ) -> CommandResult:
         """
         Start a new command and wait until it finishes executing.
@@ -159,9 +280,66 @@ class Commands:
         :param on_stderr: Callback for command stderr output
         :param stdin: If `True`, the command will have a stdin stream that you can send data to using `sandbox.commands.send_stdin()`
         :param timeout: Timeout for the command connection in **seconds**. Using `0` will not limit the command connection time
-        :param request_timeout: Timeout for the request in **seconds**
+        :param request_timeout: Timeout for opening the stream in **seconds** — the wait until envd confirms with a start event. The running stream is bounded by `timeout`
+        :param retain_output: If `False`, stdout and stderr are not accumulated in memory and are `None` on the result. Use `on_stdout`/`on_stderr` to consume the output instead
+        :param shell: Shell used to run the command, as the executable followed by its arguments. The command is passed as the last argument, e.g. `["/bin/sh", "-c"]` runs `/bin/sh -c <cmd>`. Defaults to `["/bin/bash", "-l", "-c"]`. Raises :class:`InvalidArgumentException` if `shell` is not a sequence (or is a string), is empty, or its first element is empty
 
         :return: `CommandResult` result of the command execution
+        """
+        ...
+
+    @overload
+    async def run(
+        self,
+        cmd: str,
+        background: Union[Literal[False], None] = None,
+        envs: Optional[Dict[str, str]] = None,
+        user: Optional[Username] = None,
+        cwd: Optional[str] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        stdin: Optional[bool] = None,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        *,
+        retain_output: bool,
+        shell: Optional[Sequence[str]] = None,
+    ) -> CommandResult[Optional[str]]: ...
+
+    @overload
+    async def run(
+        self,
+        cmd: str,
+        background: Literal[True],
+        envs: Optional[Dict[str, str]] = None,
+        user: Optional[Username] = None,
+        cwd: Optional[str] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        stdin: Optional[bool] = None,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        *,
+        retain_output: Literal[False],
+        shell: Optional[Sequence[str]] = None,
+    ) -> AsyncCommandHandle[None]:
+        """
+        Start a new command and return a handle to interact with it.
+
+        :param cmd: Command to execute
+        :param background: `False` if the command should be executed in the foreground, **`True` if the command should be executed in the background**
+        :param envs: Environment variables used for the command
+        :param user: User to run the command as
+        :param cwd: Working directory to run the command
+        :param on_stdout: Callback for command stdout output
+        :param on_stderr: Callback for command stderr output
+        :param stdin: If `True`, the command will have a stdin stream that you can send data to using `sandbox.commands.send_stdin()`
+        :param timeout: Timeout for the command connection in **seconds**. Using `0` will not limit the command connection time
+        :param request_timeout: Timeout for opening the stream in **seconds** — the wait until envd confirms with a start event. The running stream is bounded by `timeout`
+        :param retain_output: If `False`, stdout and stderr are not accumulated in memory and are `None` on the result. Use `on_stdout`/`on_stderr` to consume the output instead
+        :param shell: Shell used to run the command, as the executable followed by its arguments. The command is passed as the last argument, e.g. `["/bin/sh", "-c"]` runs `/bin/sh -c <cmd>`. Defaults to `["/bin/bash", "-l", "-c"]`. Raises :class:`InvalidArgumentException` if `shell` is not a sequence (or is a string), is empty, or its first element is empty
+
+        :return: `AsyncCommandHandle` handle to interact with the running command
         """
         ...
 
@@ -178,6 +356,9 @@ class Commands:
         stdin: Optional[bool] = None,
         timeout: Optional[float] = 60,
         request_timeout: Optional[float] = None,
+        *,
+        retain_output: Literal[True] = True,
+        shell: Optional[Sequence[str]] = None,
     ) -> AsyncCommandHandle:
         """
         Start a new command and return a handle to interact with it.
@@ -191,11 +372,31 @@ class Commands:
         :param on_stderr: Callback for command stderr output
         :param stdin: If `True`, the command will have a stdin stream that you can send data to using `sandbox.commands.send_stdin()`
         :param timeout: Timeout for the command connection in **seconds**. Using `0` will not limit the command connection time
-        :param request_timeout: Timeout for the request in **seconds**
+        :param request_timeout: Timeout for opening the stream in **seconds** — the wait until envd confirms with a start event. The running stream is bounded by `timeout`
+        :param retain_output: If `False`, stdout and stderr are not accumulated in memory and are `None` on the result. Use `on_stdout`/`on_stderr` to consume the output instead
+        :param shell: Shell used to run the command, as the executable followed by its arguments. The command is passed as the last argument, e.g. `["/bin/sh", "-c"]` runs `/bin/sh -c <cmd>`. Defaults to `["/bin/bash", "-l", "-c"]`. Raises :class:`InvalidArgumentException` if `shell` is not a sequence (or is a string), is empty, or its first element is empty
 
         :return: `AsyncCommandHandle` handle to interact with the running command
         """
         ...
+
+    @overload
+    async def run(
+        self,
+        cmd: str,
+        background: Literal[True],
+        envs: Optional[Dict[str, str]] = None,
+        user: Optional[Username] = None,
+        cwd: Optional[str] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        stdin: Optional[bool] = None,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        *,
+        retain_output: bool,
+        shell: Optional[Sequence[str]] = None,
+    ) -> AsyncCommandHandle[Optional[str]]: ...
 
     async def run(
         self,
@@ -209,6 +410,9 @@ class Commands:
         stdin: Optional[bool] = None,
         timeout: Optional[float] = 60,
         request_timeout: Optional[float] = None,
+        *,
+        retain_output: bool = True,
+        shell: Optional[Sequence[str]] = None,
     ):
         # Check version for stdin support
         if stdin is False and self._envd_version < ENVD_COMMANDS_STDIN:
@@ -225,11 +429,13 @@ class Commands:
             envs,
             user,
             cwd,
+            stdin,
             timeout,
             request_timeout,
-            stdin,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
+            retain_output=retain_output,
+            shell=shell,
         )
 
         return proc if background else await proc.wait()
@@ -240,49 +446,81 @@ class Commands:
         envs: Optional[Dict[str, str]],
         user: Optional[Username],
         cwd: Optional[str],
+        stdin: bool,
         timeout: Optional[float],
         request_timeout: Optional[float],
-        stdin: bool,
         on_stdout: Optional[OutputHandler[Stdout]],
         on_stderr: Optional[OutputHandler[Stderr]],
-    ) -> AsyncCommandHandle:
-        events = self._rpc.astart(
-            process_pb2.StartRequest(
-                process=process_pb2.ProcessConfig(
-                    cmd="/bin/bash",
-                    envs=envs,
-                    args=["-l", "-c", cmd],
-                    cwd=cwd,
+        retain_output: bool,
+        shell: Optional[Sequence[str]],
+    ) -> AsyncCommandHandle[Optional[str]]:
+        executable, args = shell_command(shell, cmd)
+        events = as_stream(
+            self._rpc.start(
+                process_pb.StartRequest(
+                    process=process_pb.ProcessConfig(
+                        cmd=executable,
+                        envs=envs,
+                        args=args,
+                        cwd=cwd,
+                    ),
+                    stdin=stdin,
                 ),
-                stdin=stdin,
-            ),
-            headers={
-                **authentication_header(self._envd_version, user),
-                KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
-            },
-            timeout=timeout,
-            request_timeout=self._connection_config.get_request_timeout(
-                request_timeout
-            ),
+                headers={
+                    **authentication_header(self._envd_version, user),
+                    KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
+                },
+                # The command `timeout` bounds the whole stream;
+                # `request_timeout` bounds opening it (the wait for the
+                # start event below).
+                timeout_ms=timeout_to_ms(timeout),
+            )
         )
 
-        try:
-            start_event = await events.__anext__()
+        return await self._create_handle(
+            events,
+            "start process",
+            request_timeout,
+            on_stdout,
+            on_stderr,
+            retain_output,
+        )
 
-            if not start_event.HasField("event"):
-                raise SandboxException(
-                    f"Failed to start process: expected start event, got {start_event}"
-                )
+    @overload
+    async def connect(
+        self,
+        pid: int,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        *,
+        retain_output: Literal[False],
+    ) -> AsyncCommandHandle[None]: ...
 
-            return AsyncCommandHandle(
-                pid=start_event.event.start.pid,
-                handle_kill=lambda: self.kill(start_event.event.start.pid),
-                events=events,
-                on_stdout=on_stdout,
-                on_stderr=on_stderr,
-            )
-        except Exception as e:
-            raise handle_rpc_exception(e)
+    @overload
+    async def connect(
+        self,
+        pid: int,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        *,
+        retain_output: Literal[True] = True,
+    ) -> AsyncCommandHandle: ...
+
+    @overload
+    async def connect(
+        self,
+        pid: int,
+        timeout: Optional[float] = 60,
+        request_timeout: Optional[float] = None,
+        on_stdout: Optional[OutputHandler[Stdout]] = None,
+        on_stderr: Optional[OutputHandler[Stderr]] = None,
+        *,
+        retain_output: bool,
+    ) -> AsyncCommandHandle[Optional[str]]: ...
 
     async def connect(
         self,
@@ -291,46 +529,78 @@ class Commands:
         request_timeout: Optional[float] = None,
         on_stdout: Optional[OutputHandler[Stdout]] = None,
         on_stderr: Optional[OutputHandler[Stderr]] = None,
-    ) -> AsyncCommandHandle:
+        *,
+        retain_output: bool = True,
+    ) -> AsyncCommandHandle[Optional[str]]:
         """
         Connects to a running command.
         You can use `AsyncCommandHandle.wait()` to wait for the command to finish and get execution results.
 
         :param pid: Process ID of the command to connect to. You can get the list of processes using `sandbox.commands.list()`
-        :param request_timeout: Request timeout in **seconds**
+        :param request_timeout: Timeout for opening the stream in **seconds** — the wait until envd confirms with a start event. The running stream is bounded by `timeout`
         :param timeout: Timeout for the command connection in **seconds**. Using `0` will not limit the command connection time
         :param on_stdout: Callback for command stdout output
         :param on_stderr: Callback for command stderr output
+        :param retain_output: If `False`, stdout and stderr are not accumulated in memory and are `None` on the result. Use `on_stdout`/`on_stderr` to consume the output instead
 
         :return: `AsyncCommandHandle` handle to interact with the running command
         """
-        events = self._rpc.aconnect(
-            process_pb2.ConnectRequest(
-                process=process_pb2.ProcessSelector(pid=pid),
-            ),
-            timeout=timeout,
-            request_timeout=self._connection_config.get_request_timeout(
-                request_timeout
-            ),
-            headers={
-                KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
-            },
+        events = as_stream(
+            self._rpc.connect(
+                process_pb.ConnectRequest(
+                    process=process_pb.ProcessSelector(selector=Oneof("pid", pid)),
+                ),
+                headers={
+                    KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
+                },
+                timeout_ms=timeout_to_ms(timeout),
+            )
         )
 
+        return await self._create_handle(
+            events,
+            "connect to process",
+            request_timeout,
+            on_stdout,
+            on_stderr,
+            retain_output,
+        )
+
+    async def _create_handle(
+        self,
+        events: AsyncGenerator[
+            Union[process_pb.StartResponse, process_pb.ConnectResponse], Any
+        ],
+        action: str,
+        request_timeout: Optional[float],
+        on_stdout: Optional[OutputHandler[Stdout]],
+        on_stderr: Optional[OutputHandler[Stderr]],
+        retain_output: bool,
+    ) -> AsyncCommandHandle[Optional[str]]:
         try:
-            start_event = await events.__anext__()
+            start_event = await first_event(
+                events, self._connection_config.get_request_timeout(request_timeout)
+            )
 
-            if not start_event.HasField("event"):
-                raise SandboxException(
-                    f"Failed to connect to process: expected start event, got {start_event}"
-                )
-
+            pid = extract_start_pid(start_event, action)
             return AsyncCommandHandle(
-                pid=start_event.event.start.pid,
-                handle_kill=lambda: self.kill(start_event.event.start.pid),
+                pid=pid,
+                handle_kill=lambda: self.kill(pid),
                 events=events,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
+                handle_send_stdin=lambda data, request_timeout=None: self.send_stdin(
+                    pid, data, request_timeout
+                ),
+                handle_close_stdin=lambda request_timeout=None: self.close_stdin(
+                    pid, request_timeout
+                ),
+                check_health=self._check_health,
+                retain_output=retain_output,
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            try:
+                await events.aclose()
+            except Exception:
+                pass
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)

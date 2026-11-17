@@ -1,8 +1,12 @@
-import { handleRpcError } from '../../envd/rpc'
+import {
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
 import {
   EventType,
   WatchDirResponse,
 } from '../../envd/filesystem/filesystem_pb'
+import { EntryInfo, mapEntryInfo } from './index'
 
 /**
  * Sandbox filesystem event types.
@@ -57,6 +61,14 @@ export interface FilesystemEvent {
    * Filesystem operation event type.
    */
   type: FilesystemEventType
+  /**
+   * Information about the entry that triggered the event.
+   *
+   * Only populated when the watch was started with `includeEntry: true` and the
+   * sandbox's envd version supports it. It may be `undefined` for events where the
+   * entry no longer exists at the path (e.g. remove or rename-away events).
+   */
+  entry?: EntryInfo
 }
 
 /**
@@ -65,19 +77,25 @@ export interface FilesystemEvent {
  * Use {@link WatchHandle.stop} to stop watching the directory.
  */
 export class WatchHandle {
+  private stopped = false
+
   constructor(
     private readonly handleStop: () => void,
     private readonly events: AsyncIterable<WatchDirResponse>,
     private readonly onEvent?: (event: FilesystemEvent) => void | Promise<void>,
-    private readonly onExit?: (err?: Error) => void | Promise<void>
+    private readonly onExit?: (err?: Error) => void | Promise<void>,
+    private readonly checkHealth?: SandboxHealthCheck
   ) {
     this.handleEvents()
   }
 
   /**
    * Stop watching the directory.
+   *
+   * `onExit` is then called asynchronously, with no error.
    */
   async stop() {
+    this.stopped = true
     this.handleStop()
   }
 
@@ -91,11 +109,16 @@ export class WatchHandle {
         }
       }
     } catch (err) {
-      throw handleRpcError(err)
+      // `stop()` aborts the stream, so a stream error after it is a clean end.
+      if (this.stopped) {
+        return
+      }
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
   private async handleEvents() {
+    let iterationError: Error | undefined
     try {
       for await (const event of this.iterateEvents()) {
         const eventType = mapEventType(event.value.type)
@@ -103,14 +126,36 @@ export class WatchHandle {
           continue
         }
 
-        this.onEvent?.({
+        // Await the callback so an async `onEvent` that rejects is routed to
+        // `onExit` below (instead of becoming an unhandled promise rejection
+        // that can crash Node) and so the user can apply backpressure. Mirrors
+        // `CommandHandle.handleEvents`.
+        await this.onEvent?.({
           name: event.value.name,
           type: eventType,
+          entry: event.value.entry
+            ? mapEntryInfo(event.value.entry)
+            : undefined,
         })
       }
-      this.onExit?.()
     } catch (err) {
-      this.onExit?.(err as Error)
+      iterationError = err as Error
+    }
+
+    try {
+      // Invoke `onExit` exactly once: with the error when the watch ended
+      // because of one, or with no argument on a clean end.
+      if (iterationError) {
+        await this.onExit?.(iterationError)
+      } else {
+        await this.onExit?.()
+      }
+    } catch {
+      // `onExit` is the terminal callback; an error it throws has nowhere to
+      // propagate in this detached handler, so it's swallowed to avoid an
+      // unhandled promise rejection (the failure mode this guards against).
+    } finally {
+      this.handleStop()
     }
   }
 }

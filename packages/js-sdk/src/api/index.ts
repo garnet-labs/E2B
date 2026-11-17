@@ -2,9 +2,56 @@ import createClient, { FetchResponse } from 'openapi-fetch'
 
 import type { components, paths } from './schema.gen'
 import { defaultHeaders } from './metadata'
+import { createApiFetch } from './http2'
 import { ConnectionConfig } from '../connectionConfig'
-import { AuthenticationError, RateLimitError, SandboxError } from '../errors'
+import {
+  AuthenticationError,
+  RateLimitError,
+  ServiceBusyError,
+  SandboxError,
+  GuestUnresponsiveError,
+} from '../errors'
 import { createApiLogger } from '../logs'
+import { withRetry } from '../retry'
+
+/**
+ * Map an API error code and message to the matching error class — the same
+ * mapping {@link handleApiError} applies to HTTP responses, usable for error
+ * objects embedded in response bodies (e.g. per-fork results).
+ */
+export function apiErrorFromCode(
+  code: number,
+  content: unknown,
+  errorClass: new (
+    message: string,
+    stackTrace?: string
+  ) => Error = SandboxError,
+  stackTrace?: string
+): Error {
+  if (code === 401) {
+    const message = 'Unauthorized, please check your credentials.'
+    return new AuthenticationError(
+      content ? `${message} - ${content}` : message
+    )
+  }
+
+  if (code === 429) {
+    const message = 'Rate limit exceeded, please try again later'
+    return new RateLimitError(content ? `${message} - ${content}` : message)
+  }
+
+  if (code === 503) {
+    const message = 'Service temporarily unavailable, please retry'
+    return new ServiceBusyError(content ? `${message} - ${content}` : message)
+  }
+
+  const err = new errorClass(`${code}: ${content}`, stackTrace)
+  if (err instanceof SandboxError) {
+    err.statusCode = code
+  }
+
+  return err
+}
 
 export function handleApiError(
   response: FetchResponse<any, any, any>,
@@ -14,34 +61,34 @@ export function handleApiError(
   ) => Error = SandboxError,
   stackTrace?: string
 ): Error | undefined {
-  // openapi-fetch returns empty string for error when response body is empty,
-  // so we check !== undefined instead of truthiness
-  if (response.error === undefined) {
+  // openapi-fetch leaves `error` undefined for non-2xx responses with
+  // Content-Length: 0, so check the status instead
+  if (response.response.ok) {
     return
   }
 
-  if (response.response.status === 401) {
-    const message = 'Unauthorized, please check your credentials.'
-    const content = response.error?.message ?? response.error
-
-    if (content) {
-      return new AuthenticationError(`${message} - ${content}`)
-    }
-    return new AuthenticationError(message)
+  const status = response.response.status
+  if (response.error?.error_code === GuestUnresponsiveError.code) {
+    return new GuestUnresponsiveError(
+      `${response.error.message}. Resume the sandbox with \`onResume: 'reboot'\`.`
+    )
   }
 
-  if (response.response.status === 429) {
-    const message = 'Rate limit exceeded, please try again later'
-    const content = response.error?.message ?? response.error
-
-    if (content) {
-      return new RateLimitError(`${message} - ${content}`)
-    }
-    return new RateLimitError(message)
+  if (status === 401 || status === 429 || status === 503) {
+    return apiErrorFromCode(
+      status,
+      response.error?.message ?? response.error,
+      errorClass,
+      stackTrace
+    )
   }
 
-  const message = response.error?.message ?? response.error
-  return new errorClass(`${response.response.status}: ${message}`, stackTrace)
+  return apiErrorFromCode(
+    status,
+    response.error?.message || response.error || response.response.statusText,
+    errorClass,
+    stackTrace
+  )
 }
 
 /**
@@ -53,35 +100,34 @@ class ApiClient {
   constructor(
     config: ConnectionConfig,
     opts: {
-      requireAccessToken?: boolean
       requireApiKey?: boolean
-    } = { requireAccessToken: false, requireApiKey: false }
+    } = {}
   ) {
-    if (opts?.requireApiKey && !config.apiKey) {
+    // An `Authorization` header (e.g. an OAuth access token passed through
+    // `apiHeaders`) authenticates the request in place of an API key.
+    const hasAuthorization = Object.keys(config.headers ?? {}).some(
+      (name) => name.toLowerCase() === 'authorization'
+    )
+    if ((opts.requireApiKey ?? true) && !config.apiKey && !hasAuthorization) {
       throw new AuthenticationError(
-        'API key is required, please visit the Team tab at https://e2b.dev/dashboard to get your API key. ' +
+        'API key is required, please visit the API Keys tab at https://e2b.dev/dashboard?tab=keys to get your API key. ' +
           'You can either set the environment variable `E2B_API_KEY` ' +
           "or you can pass it directly to the sandbox like Sandbox.create({ apiKey: 'e2b_...' })"
       )
     }
 
-    if (opts?.requireAccessToken && !config.accessToken) {
-      throw new AuthenticationError(
-        'Access token is required, please visit the Personal tab at https://e2b.dev/dashboard to get your access token. ' +
-          'You can set the environment variable `E2B_ACCESS_TOKEN` or pass the `accessToken` in options.'
-      )
-    }
-
     this.api = createClient<paths>({
       baseUrl: config.apiUrl,
+      fetch: withRetry(
+        createApiFetch(config),
+        config.retries,
+        config.requestTimeoutMs
+      ),
       // In HTTP 1.1, all connections are considered persistent unless declared otherwise
       // keepalive: true,
       headers: {
         ...defaultHeaders,
         ...(config.apiKey && { 'X-API-KEY': config.apiKey }),
-        ...(config.accessToken && {
-          Authorization: `Bearer ${config.accessToken}`,
-        }),
         ...config.headers,
       },
       querySerializer: {
