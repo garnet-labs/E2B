@@ -1,0 +1,52 @@
+name: Garnet record ready
+
+on:
+  pull_request:
+    types: [synchronize]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: garnet-record-ready-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  record-ready:
+    name: Garnet record ready
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'devin/1795032310-api-types-check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Wait for the finalized runtime record
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 45 * 60))
+          while (( SECONDS < deadline )); do
+            if gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" |
+              jq -e --arg head "$HEAD_SHA" '
+                any(.[][]; .user.login == "garnet-runtime-review[bot]" and
+                  (.body | split("\n") |
+                    index("<!-- garnet-runtime-review -->") != null and
+                    index("<!-- garnet:commit \($head) -->") != null and
+                    any(.[]; startswith("<!-- garnet:summary ") and endswith(" -->") and
+                      (ltrimstr("<!-- garnet:summary ") | rtrimstr(" -->") |
+                        (try fromjson catch null) |
+                        .commit == $head and .status == "finalized"))))
+              ' >/dev/null; then
+              echo "Finalized Garnet record found for ${HEAD_SHA}."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Timed out waiting for the finalized Garnet record for ${HEAD_SHA}."
+          exit 1
