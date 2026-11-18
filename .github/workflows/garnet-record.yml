@@ -63,6 +63,12 @@ jobs:
             (cd "$d" && uv sync --frozen)
           done
 
+      - name: Check generated JS SDK API types
+        continue-on-error: true
+        run: |
+          pnpm --dir packages/js-sdk generate:api
+          git diff --exit-code -- packages/js-sdk/src/api/schema.gen.ts
+
       - name: Let sensor settle
         if: always()
         run: sleep 30
