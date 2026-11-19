@@ -63,6 +63,15 @@ jobs:
             (cd "$d" && uv sync --frozen)
           done
 
+      - name: Test JS SDK connection configuration in Chrome
+        timeout-minutes: 3
+        env:
+          PLAYWRIGHT_BROWSER_CHANNEL: chrome
+        run: >-
+          pnpm --dir packages/js-sdk exec vitest run
+          --config tests/runtimes/browser/vitest.config.mts
+          tests/connectionConfig.test.ts tests/connectionConfig.browser.test.ts
+
       - name: Let sensor settle
         if: always()
         run: sleep 30
