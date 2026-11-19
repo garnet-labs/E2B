@@ -9,6 +9,7 @@ import { defineConfig, type Plugin } from 'vitest/config'
 
 // Real env vars win over `.env`, matching dotenv's own precedence.
 const env = { ...config().parsed, ...process.env }
+const browserChannel = process.env.PLAYWRIGHT_BROWSER_CHANNEL
 
 // Config the shared suites read from the environment; everything the SDK takes
 // is `E2B_`-prefixed. Forwarded by name rather than as the whole environment,
@@ -105,7 +106,9 @@ export default defineConfig({
       // screenshot is a picture of a blank page. Off by default it would write
       // one PNG per failed test into .vitest-attachments/.
       screenshotFailures: false,
-      provider: playwright(),
+      provider: playwright(
+        browserChannel ? { launchOptions: { channel: browserChannel } } : {}
+      ),
       instances: [{ browser: 'chromium' }],
     },
   },
