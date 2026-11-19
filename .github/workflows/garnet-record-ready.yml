@@ -1,0 +1,53 @@
+# Signal reviewers only after a finalized record for this PR head is mirrored.
+name: Garnet record ready
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: garnet-record-ready-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  record-ready:
+    name: Garnet record ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Wait for finalized Garnet evidence in the PR description
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 45 * 60))
+          while (( SECONDS < deadline )); do
+            if body=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .body) &&
+              block=$(sed -n '/^<!-- garnet:evidence:begin -->$/,/^<!-- garnet:evidence:end -->$/p' <<< "$body") &&
+              grep -Fxq '<!-- garnet:evidence:end -->' <<< "$block" &&
+              grep -Fxq "<!-- garnet:commit ${HEAD_SHA} -->" <<< "$block" &&
+              summaries=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" |
+                jq -r --arg head "$HEAD_SHA" '
+                  .[][] | select(.user.login == "garnet-runtime-review[bot]") |
+                  .body | split("\n") |
+                  select(index("<!-- garnet-runtime-review -->") != null and
+                    index("<!-- garnet:commit \($head) -->") != null) |
+                  .[] | select(startswith("<!-- garnet:summary ") and endswith(" -->")) |
+                  select(ltrimstr("<!-- garnet:summary ") | rtrimstr(" -->") |
+                    (try fromjson catch null) | .commit == $head and .status == "finalized")
+                ') &&
+              [[ -n "$summaries" ]] && grep -Fxf <(printf '%s\n' "$summaries") <<< "$block" >/dev/null; then
+              echo "Finalized Garnet evidence for ${HEAD_SHA} is in the description."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes."
+          exit 1
