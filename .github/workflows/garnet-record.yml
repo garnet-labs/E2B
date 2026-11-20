@@ -63,6 +63,10 @@ jobs:
             (cd "$d" && uv sync --frozen)
           done
 
+      - name: Check Cloudflare smoke-worker environment types
+        run: |
+          pnpm --dir packages/js-sdk exec wrangler types "$RUNNER_TEMP/cf-worker-env.d.ts" --config tests/runtimes/cloudflare-deploy/wrangler.jsonc --include-runtime=false
+
       - name: Let sensor settle
         if: always()
         run: sleep 30
