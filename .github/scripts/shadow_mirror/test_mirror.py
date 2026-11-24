@@ -487,6 +487,38 @@ class DeferredPRTest(unittest.TestCase):
         self.assertIn('`.tool-versions` (recorder installs)', body)
         self.assertIn('Node.js 22.23.3 → 22.23.4', body)
 
+    def test_workspace_summary_reads_sections_and_keeps_exact_selector_and_git_ref(self):
+        mirror = self.make_mirror()
+        mirror.patterns = INSTALL_PATTERNS
+        mirror.api.pages.return_value = [{
+            'filename': 'pnpm-workspace.yaml',
+            'patch': ' overrides:\n-  "pkg@1.2.3": "github:org/pkg#old"\n'
+                     '+  "pkg@1.2.3": "github:org/pkg#new"\n'
+                     '-minimumReleaseAge: 60\n+minimumReleaseAge: 120',
+        }]
+        documents = {
+            'source-merge-base': 'minimumReleaseAge: 60\ncatalogs:\n  tools:\n    vite: 1\n'
+                                 'overrides:\n  "pkg@1.2.3": "github:org/pkg#old"\n',
+            'source-head': 'minimumReleaseAge: 120\ncatalogs:\n  tools:\n    vite: "2"\n'
+                           'overrides:\n  "pkg@1.2.3": "github:org/pkg#new"\n',
+        }
+        fixture = mirror.api.call.side_effect
+
+        def call(repo, path):
+            if repo == SOURCE and path.startswith('contents/pnpm-workspace.yaml?ref='):
+                document = documents[path.split('=', 1)[1]]
+                return {'content': base64.b64encode(document.encode()).decode()}
+            return fixture(repo, path)
+
+        mirror.api.call.side_effect = call
+        with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+            result = mirror.sync(1)
+            body = Path(result['body_file']).read_text()
+        self.assertIn('pkg@1.2.3', body)
+        self.assertIn('github:org/pkg#old → github:org/pkg#new', body)
+        self.assertIn('vite 1 → 2', body)
+        self.assertNotIn('minimumReleaseAge', body)
+
     def test_unused_tool_version_bumps_are_listed_without_install_claim(self):
         for name, old, new in [('bun', '1.4.4', '1.4.5'), ('deno', '2.9.8', '2.9.9'),
                                ('pnpm', '10.34.5', '10.34.6')]:
@@ -543,16 +575,19 @@ class VersionsTest(unittest.TestCase):
         self.assertEqual(version_transitions('pnpm-lock.yaml', patch), [('@scope/pkg', '1.0.0', '2.0.0'), ('lib', '1.0.0', '2.0.0')])
 
     def test_pnpm_workspace_double_quoted_catalog_entry(self):
-        patch = ' catalog:\n-  "@types/node": "^22.20.5"\n+  "@types/node": "^22.20.6"'
-        self.assertEqual(version_transitions('pnpm-workspace.yaml', patch), [('@types/node', '^22.20.5', '^22.20.6')])
+        documents = ('catalog:\n  "@types/node": "^22.20.5"', 'catalog:\n  "@types/node": "^22.20.6"')
+        self.assertEqual(version_transitions('pnpm-workspace.yaml', None, workspace_documents=documents),
+                         [('@types/node', '^22.20.5', '^22.20.6')])
 
     def test_pnpm_workspace_catalog_bump_across_quote_styles(self):
         for name, plain, double in [('vite', 'vite: ^{version}', '"vite": "^{version}"'),
                                     ('@types/node', "'@types/node': '^{version}'", '"@types/node": "^{version}"')]:
             for before, after in [(plain, double), (double, plain)]:
                 with self.subTest(before=before, after=after):
-                    patch = f" catalog:\n-  {before.format(version='1.0.0')}\n+  {after.format(version='1.0.1')}"
-                    self.assertEqual(version_transitions('pnpm-workspace.yaml', patch), [(name, '^1.0.0', '^1.0.1')])
+                    documents = (f"catalog:\n  {before.format(version='1.0.0')}",
+                                 f"catalog:\n  {after.format(version='1.0.1')}")
+                    self.assertEqual(version_transitions('pnpm-workspace.yaml', None, workspace_documents=documents),
+                                     [(name, '^1.0.0', '^1.0.1')])
 
     def test_pnpm_range_overrides(self):
         patch = (
@@ -561,8 +596,16 @@ class VersionsTest(unittest.TestCase):
             "-  '@babel/core@>=7.0.0 <7.29.6': ^7.29.6\n+  '@babel/core@>=7.0.0 <7.29.6': ^7.29.7"
         )
         expected = [('@babel/core@>=7.0.0 <7.29.6', '^7.29.6', '^7.29.7'), ('rollup@>=4', '>=4.59.0', '>=4.60.0')]
-        for filename in ('pnpm-workspace.yaml', 'pnpm-lock.yaml'):
-            self.assertEqual(version_transitions(filename, patch), expected)
+        documents = ("overrides:\n  rollup@>=4: '>=4.59.0'\n  '@babel/core@>=7.0.0 <7.29.6': ^7.29.6",
+                     "overrides:\n  rollup@>=4: '>=4.60.0'\n  '@babel/core@>=7.0.0 <7.29.6': ^7.29.7")
+        self.assertEqual(version_transitions('pnpm-workspace.yaml', None, workspace_documents=documents), expected)
+        self.assertEqual(version_transitions('pnpm-lock.yaml', patch), expected)
+
+    def test_pnpm_workspace_exact_overrides_preserve_git_ref_scalars(self):
+        documents = ('overrides: {"pkg@1.2.3": "git+https://host/pkg.git#v1"}',
+                     'overrides:\n  pkg@1.2.3: git+https://host/pkg.git#v2 # default branch')
+        self.assertEqual(version_transitions('pnpm-workspace.yaml', None, workspace_documents=documents),
+                         [('pkg@1.2.3', 'git+https://host/pkg.git#v1', 'git+https://host/pkg.git#v2')])
 
     def test_go_rust_python_locks_and_node(self):
         self.assertEqual(version_transitions('go.mod', '-example.com/lib v1.0.0\n+example.com/lib v2.0.0'), [('example.com/lib', 'v1.0.0', 'v2.0.0')])

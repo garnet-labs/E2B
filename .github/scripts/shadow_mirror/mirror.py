@@ -13,13 +13,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import yaml
+
 FORK = 'garnet-labs/E2B'
 SOURCE = 'e2b-dev/E2B'
 BRANCH = 'main'
 RECORDER = 'garnet-record.yml'
 WORKFLOW = f'.github/workflows/{RECORDER}'
+WORKSPACE_MANIFEST = 'pnpm-workspace.yaml'
 INSTALL_PATTERNS = (
-    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml',
+    'package.json', 'pnpm-lock.yaml', WORKSPACE_MANIFEST,
     *(f'packages/{package}/{manifest}'
       for package in ('python-sdk', 'code-interpreter-python', 'desktop-python')
       for manifest in ('pyproject.toml', 'uv.lock')),
@@ -90,7 +93,7 @@ def dependency_file(filename):
         return True
     name = filename.rsplit('/', 1)[-1]
     return name in {
-        'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package-lock.json',
+        'package.json', 'pnpm-lock.yaml', WORKSPACE_MANIFEST, 'package-lock.json',
         'npm-shrinkwrap.json', 'yarn.lock', 'bun.lock', 'bun.lockb', 'pyproject.toml',
         'uv.lock', 'poetry.lock', 'Pipfile', 'Pipfile.lock', 'go.mod', 'go.sum',
         'Cargo.toml', 'Cargo.lock', '.node-version', '.nvmrc',
@@ -110,14 +113,39 @@ def recorder_installs(filename, patterns, workspace, transitions=()):
     return path_matches(directory, included) and not path_matches(directory, excluded)
 
 
-def version_transitions(filename, patch):
-    """Read paired dependency declarations from a unified manifest diff."""
+def workspace_dependencies(text):
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    if not isinstance(document, dict):
+        return {}
+    sections = {(section, ''): document.get(section) for section in ('catalog', 'overrides')}
+    catalogs = document.get('catalogs')
+    if isinstance(catalogs, dict):
+        sections.update({('catalogs', name): entries for name, entries in catalogs.items()})
+    return {
+        (name, section, catalog): version
+        for (section, catalog), entries in sections.items() if isinstance(entries, dict)
+        for name, version in entries.items() if isinstance(version, str)
+    }
+
+
+def version_transitions(filename, patch, *, workspace_documents=None):
+    """Compare workspace manifests structurally and other manifests by diff."""
     if not dependency_file(filename):
         return []
+    if filename.rsplit('/', 1)[-1] == WORKSPACE_MANIFEST:
+        if workspace_documents is None:
+            return []
+        try:
+            before, after = map(workspace_dependencies, workspace_documents)
+        except yaml.YAMLError:
+            return []
+        return [
+            (key[0], before.get(key, '∅'), after.get(key, '∅'))
+            for key in sorted(before.keys() | after.keys()) if before.get(key) != after.get(key)
+        ]
     sides = {'-': {}, '+': {}}
     package = None
     pnpm = filename.endswith('pnpm-lock.yaml')
-    pnpm_workspace = filename.endswith('pnpm-workspace.yaml')
     package_lock = filename.endswith(('Cargo.lock', 'uv.lock', 'poetry.lock'))
     for line in (patch or '').splitlines():
         if line.startswith('@@'):
@@ -144,12 +172,6 @@ def version_transitions(filename, patch):
             match = re.match(r'version\s*=\s*"([^"]+)"', value)
             if match:
                 pair = (package, match[1])
-        elif pnpm_workspace:
-            match = re.fullmatch(
-                r"""(['"]?)((?:@[\w.-]+/)?[\w.-]+(?:@[^:'"]*[<>=][^:'"]*)?)\1:\s*(['"]?)([^'"#]+?)\3(?:\s+#.*)?""",
-                value)
-            if match:
-                pair = (match[2], match[4])
         elif pnpm:
             match = re.fullmatch(r"""['"]?((?:@[\w.-]+/)?[\w.-]+@[^:'"]*[<>=][^:'"]*)['"]?:\s*['"]?([^'"#]+?)['"]?""", value)
             if not match:
@@ -164,9 +186,9 @@ def version_transitions(filename, patch):
             match = re.match(r'(\S+)\s+(v\S+?)(?:/go.mod)?(?:\s|$)', value)
             if match:
                 pair = (match[1], match[2])
-        if not pair and not (pnpm or pnpm_workspace or package_lock):
+        if not pair and not (pnpm or package_lock):
             pair = re.match(r'"([^"\s]+)"\s*:\s*"([^"]+)"', value)
-        if not pair and not (pnpm or pnpm_workspace or package_lock):
+        if not pair and not (pnpm or package_lock):
             pair = re.match(r'["\']?([A-Za-z0-9_.-]+(?:\[[^\]]+\])?)\s*(?:=\s*["\']|(?=[<>=!~]))([^"\';]+)', value)
         if pair:
             name, version = (pair[1], pair[2]) if isinstance(pair, re.Match) else pair
@@ -249,6 +271,25 @@ class Mirror:
     def merge_base(self, pr):
         comparison = self.api.call(SOURCE, f'compare/{pr["base"]["sha"]}...{pr["head"]["sha"]}')
         return comparison['merge_base_commit']['sha']
+
+    def source_file(self, filename, sha):
+        path = urllib.parse.quote(filename)
+        content = self.api.call(SOURCE, f'contents/{path}?ref={sha}')
+        return base64.b64decode(content['content']).decode()
+
+    def manifest_transitions(self, file, base, head):
+        filename = file['filename']
+        previous = file.get('previous_filename') or filename
+        patch = file.get('patch')
+        old_workspace = previous.rsplit('/', 1)[-1] == WORKSPACE_MANIFEST
+        new_workspace = filename.rsplit('/', 1)[-1] == WORKSPACE_MANIFEST
+        if not (old_workspace or new_workspace):
+            manifest = filename if dependency_file(filename) else previous
+            return version_transitions(manifest, patch)
+        status = file.get('status')
+        before = self.source_file(previous, base) if old_workspace and status != 'added' else ''
+        after = self.source_file(filename, head) if new_workspace and status != 'removed' else ''
+        return version_transitions(WORKSPACE_MANIFEST, patch, workspace_documents=(before, after))
 
     def branches(self, number, existing, new_revision=False):
         if existing and existing['state'] == 'open' and not new_revision:
@@ -368,12 +409,12 @@ class Mirror:
                     'upstream_base': upstream_base, 'upstream_head': pr['head']['sha']}
         workspace = []
         if any(f['filename'].endswith('/package.json') and not path_matches(f['filename'], self.patterns) for f in files):
-            content = api.call(SOURCE, f'contents/pnpm-workspace.yaml?ref={pr["head"]["sha"]}')
-            document = base64.b64decode(content['content']).decode()
+            document = self.source_file(WORKSPACE_MANIFEST, pr['head']['sha'])
             section = re.search(r'(?m)^packages:\s*\n(.*?)(?=^\S|\Z)', document, re.S)
             if not section:
                 raise ValueError('Missing workspace packages list')
             workspace = [m.strip().strip("'\"") for m in re.findall(r'(?m)^\s+-\s+([^\n]+)', section[1])]
+        changes = [(file, self.manifest_transitions(file, upstream_base, pr['head']['sha'])) for file in matched]
         if existing:
             baseline = existing['base']['sha']
             parent = api.call(FORK, f'git/ref/heads/{head_branch}')['object']['sha']
@@ -414,15 +455,13 @@ class Mirror:
             head = self.commit(tree, [parent], title)
             self.ref(head_branch, head)
         lines = ['Dependency files changed:', '']
-        for file in matched:
+        for file, transitions in changes:
             filename = file['filename']
             previous = file.get('previous_filename')
             label = f'`{scrub_title(filename)}`'
             if previous:
                 label = f'`{scrub_title(previous)}` → {label}'
-            manifest = filename if dependency_file(filename) else previous
             patch = file.get('patch')
-            transitions = version_transitions(manifest, patch)
             if filename == '.tool-versions' and not patch:
                 recorded = 'recorder coverage unknown'
             elif recorder_installs(filename, self.patterns, workspace, transitions):
