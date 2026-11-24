@@ -5,7 +5,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
 
+import yaml
+
 from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, VERDICT, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
+
+
+class RecorderPermissionsTest(unittest.TestCase):
+    def test_recorder_jobs_grant_oidc_for_shadow_pull_requests_and_bases(self):
+        path = Path(__file__).resolve().parents[2] / 'workflows' / RECORDER
+        workflow = yaml.load(path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+        self.assertEqual(workflow['permissions'], {})
+        self.assertIn('pull_request', workflow['on'])
+        self.assertIn('workflow_dispatch', workflow['on'])
+        self.assertIn('shadow/base/**', workflow['on']['push']['branches'])
+        self.assertEqual(set(workflow['jobs']), {'install-test', 'docker-build'})
+        for name, job in workflow['jobs'].items():
+            with self.subTest(job=name):
+                self.assertNotIn('if', job)
+                self.assertEqual(job['permissions'], {'contents': 'read', 'id-token': 'write'})
 
 
 class PathsTest(unittest.TestCase):

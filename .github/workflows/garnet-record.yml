@@ -21,17 +21,12 @@ concurrency:
 jobs:
   install-test:
     name: Dependency install (recorded)
-    if: &oidc_recording >-
-      (github.event_name == 'push' ||
-       (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/shadow/base/')) ||
-       (github.event_name == 'pull_request' &&
-        !startsWith(github.head_ref, 'shadow/pr/') && !startsWith(github.base_ref, 'shadow/base/')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
-    steps: &dependency_steps
+    steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -58,7 +53,8 @@ jobs:
         with:
           version: '${{ env.TOOL_VERSION_UV }}'
 
-
+      # OIDC exchange; pull requests from other repositories receive no token
+      # and the action falls back to a local, best-effort record.
       - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
 
       - name: Install dependencies (lifecycle scripts execute here)
@@ -74,13 +70,12 @@ jobs:
 
   docker-build:
     name: Codegen image build (recorded)
-    if: *oidc_recording
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
-    steps: &codegen_steps
+    steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -91,29 +86,3 @@ jobs:
       - name: Let sensor settle
         if: always()
         run: sleep 30
-
-  # PR runs can relay profiles as artifacts. Push and dispatch baselines
-  # still need the OIDC path because the App only collects PR artifacts.
-  shadow-install-test:
-    name: Dependency install (recorded)
-    if: &shadow_recording >-
-      github.event_name == 'pull_request' &&
-      (startsWith(github.head_ref, 'shadow/pr/') || startsWith(github.base_ref, 'shadow/base/'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      GARNET_PROFILE_JOB: install-test
-    steps: *dependency_steps
-
-  shadow-docker-build:
-    name: Codegen image build (recorded)
-    if: *shadow_recording
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    env:
-      GARNET_PROFILE_JOB: docker-build
-    steps: *codegen_steps
