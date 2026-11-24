@@ -1,6 +1,9 @@
 {
   "name": "e2b",
   "private": true,
+  "engines": {
+    "pnpm": ">=10.16.0 <11"
+  },
   "scripts": {
     "version": "pnpm changeset version && pnpm run -r postVersion && pnpm run -r lock",
     "publish": "pnpm --dir packages/js-sdk build && pnpm run -r postPublish && pnpm changeset publish",
@@ -31,8 +34,5 @@
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
-  },
-  "engines": {
-    "pnpm": ">=10.16.0 <11"
   }
 }
