@@ -515,9 +515,11 @@ class DeferredPRTest(unittest.TestCase):
         }]
         documents = {
             'source-merge-base': 'minimumReleaseAge: 60\ncatalogs:\n  tools:\n    vite: 1\n'
-                                 'overrides:\n  "pkg@1.2.3": "github:org/pkg#old"\n',
+                                 'overrides:\n  "pkg@1.2.3": "github:org/pkg#old"\n'
+                                 '  "other-pkg@2.3.4": "git+https://example.com/other.git#123"\n',
             'source-head': 'minimumReleaseAge: 120\ncatalogs:\n  tools:\n    vite: "2"\n'
-                           'overrides:\n  "pkg@1.2.3": "github:org/pkg#new"\n',
+                           'overrides:\n  "pkg@1.2.3": "github:org/pkg#new"\n'
+                           '  "other-pkg@2.3.4": "git+https://example.com/other.git#refs/heads/next"\n',
         }
         fixture = mirror.api.call.side_effect
 
@@ -533,6 +535,8 @@ class DeferredPRTest(unittest.TestCase):
             body = Path(result['body_file']).read_text()
         self.assertIn('pkg@1.2.3', body)
         self.assertIn('github:org/pkg#old → github:org/pkg#new', body)
+        self.assertIn('`#123` → `#refs/heads/next`', body)
+        self.assertNotIn('https://example.com', body)
         self.assertIn('vite 1 → 2', body)
         self.assertNotIn('minimumReleaseAge', body)
 

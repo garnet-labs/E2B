@@ -49,6 +49,11 @@ def scrub_title(title):
     return ' '.join(title.split()).strip() or 'Dependency update'
 
 
+def scrub_version(version):
+    match = re.fullmatch(r'git\+https?://[^\s#]+#([^\s`]+)', version, re.IGNORECASE)
+    return f'`#{match[1]}`' if match else scrub_title(version)
+
+
 def path_matches(path, patterns):
     if path == WORKFLOW:
         return False
@@ -470,7 +475,7 @@ class Mirror:
                 recorded = 'not installed by recorder'
             lines.append(f'- {label} ({recorded})')
             for name, old, new in transitions:
-                lines.append(f'  - {scrub_title(name)} {scrub_title(old)} → {scrub_title(new)}')
+                lines.append(f'  - {scrub_title(name)} {scrub_version(old)} → {scrub_version(new)}')
         lines.extend(['', f'Mirror base `{baseline}` → head `{head}`', '',
                       f'<!-- garnet-shadow-mirror upstream={number} upstream_head={pr["head"]["sha"]} upstream_base={upstream_base} -->'])
         data = {'title': title, 'body': '\n'.join(lines)}
