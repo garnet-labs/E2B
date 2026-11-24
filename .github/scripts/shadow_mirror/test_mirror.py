@@ -106,7 +106,8 @@ class DeferredPRTest(unittest.TestCase):
             if path.startswith('contents/pnpm-workspace.yaml'):
                 return {'content': base64.b64encode(b'packages:\n  - services/mcp\n  - nodejs\n').decode()}
             if repo == SOURCE:
-                return {'state': 'open', 'draft': False, 'author_association': 'MEMBER', 'user': {'type': 'User'}, 'base': {'ref': 'main', 'sha': 'source-base'},
+                return {'state': 'open', 'draft': False, 'author_association': 'CONTRIBUTOR',
+                        'user': {'type': 'Bot', 'login': 'dependabot[bot]', 'id': 49699333}, 'base': {'ref': 'main', 'sha': 'source-base'},
                         'head': {'sha': 'source-head', 'repo': {'full_name': SOURCE}}, 'title': 'Bump pnpm'}
             if path.startswith('git/ref/heads/shadow/base/'):
                 return {'object': {'sha': 'baseline'}}
@@ -174,15 +175,16 @@ class DeferredPRTest(unittest.TestCase):
         mirror.commit.assert_called_once_with('head-tree', [], 'chore: shadow baseline')
         mirror.ref.assert_called_once_with('shadow/base/1-r2', 'fresh-baseline')
 
-    def test_only_trusted_authors_and_bots_are_selected(self):
+    def test_only_allowlisted_bots_with_upstream_heads_are_selected(self):
         dependabot = {'type': 'Bot', 'login': 'dependabot[bot]', 'id': 49699333}
         devin = {'type': 'Bot', 'login': 'devin-ai-integration[bot]', 'id': 158243242}
         for association, user, head_repo, expected in [
             ('NONE', {'type': 'User'}, SOURCE, 'untrusted_author'),
             ('CONTRIBUTOR', {'type': 'User'}, SOURCE, 'untrusted_author'),
-            ('OWNER', {'type': 'User'}, SOURCE, 'dry-run'),
-            ('MEMBER', {'type': 'User'}, SOURCE, 'dry-run'),
-            ('COLLABORATOR', {'type': 'User'}, SOURCE, 'dry-run'),
+            ('OWNER', {'type': 'User'}, SOURCE, 'untrusted_author'),
+            ('MEMBER', {'type': 'User'}, SOURCE, 'untrusted_author'),
+            ('MEMBER', {'type': 'User'}, 'shared/e2b', 'untrusted_author'),
+            ('COLLABORATOR', {'type': 'User'}, SOURCE, 'untrusted_author'),
             ('NONE', {'type': 'Bot'}, SOURCE, 'untrusted_author'),
             ('NONE', dependabot, SOURCE, 'dry-run'),
             ('NONE', dependabot, 'other/e2b', 'untrusted_author'),

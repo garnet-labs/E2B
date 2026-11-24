@@ -304,8 +304,7 @@ class Mirror:
             return {'status': 'closed' if existing else 'skipped'}
         if pr['draft'] or pr['base']['ref'] != BRANCH:
             return {'status': 'skipped'}
-        bot = dependency_bot(pr)
-        if not bot and pr.get('author_association') not in {'OWNER', 'MEMBER', 'COLLABORATOR'}:
+        if not dependency_bot(pr):
             return {'status': 'untrusted_author'}
         upstream_base = self.merge_base(pr)
         open_mirror = existing if existing and existing['state'] == 'open' else None
@@ -322,7 +321,7 @@ class Mirror:
         only_dependencies = all(
             file in matched or path_matches(file['filename'], ('.changeset/*.md', 'codegen.Dockerfile'))
             for file in files)
-        bot_update = bot and pr['title'].lower().startswith(('chore(deps):', 'fix(deps):', 'build(deps):', 'update dependency '))
+        bot_update = pr['title'].lower().startswith(('chore(deps):', 'fix(deps):', 'build(deps):', 'update dependency '))
         if not matched or not (only_dependencies or bot_update):
             if open_mirror:
                 if self.dry_run:
