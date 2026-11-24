@@ -421,8 +421,14 @@ class Mirror:
             if previous:
                 label = f'`{scrub_title(previous)}` → {label}'
             manifest = filename if dependency_file(filename) else previous
-            transitions = version_transitions(manifest, file.get('patch'))
-            recorded = 'recorder installs' if recorder_installs(filename, self.patterns, workspace, transitions) else 'not installed by recorder'
+            patch = file.get('patch')
+            transitions = version_transitions(manifest, patch)
+            if filename == '.tool-versions' and not patch:
+                recorded = 'recorder coverage unknown'
+            elif recorder_installs(filename, self.patterns, workspace, transitions):
+                recorded = 'recorder installs'
+            else:
+                recorded = 'not installed by recorder'
             lines.append(f'- {label} ({recorded})')
             for name, old, new in transitions:
                 lines.append(f'  - {scrub_title(name)} {scrub_title(old)} → {scrub_title(new)}')

@@ -502,6 +502,19 @@ class DeferredPRTest(unittest.TestCase):
                 self.assertIn('`.tool-versions` (not installed by recorder)', body)
                 self.assertIn(f'{name} {old} → {new}', body)
 
+    def test_tool_version_recorder_coverage_is_unknown_when_patch_is_omitted(self):
+        mirror = self.make_mirror()
+        mirror.patterns = INSTALL_PATTERNS
+        mirror.api.pages.return_value = [
+            {'filename': '.tool-versions'},
+            {'filename': 'pnpm-lock.yaml'},
+        ]
+        with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+            result = mirror.sync(1)
+            body = Path(result['body_file']).read_text()
+        self.assertIn('`.tool-versions` (recorder coverage unknown)', body)
+        self.assertIn('`pnpm-lock.yaml` (recorder installs)', body)
+
     def test_export_error_does_not_open_pr(self):
         mirror = self.make_mirror()
         with patch('mirror.Path') as path:
