@@ -342,6 +342,24 @@ class DeferredPRTest(unittest.TestCase):
         mirror.commit.assert_called_once_with('changed-tree', ['head'], 'Bump pnpm')
         mirror.ref.assert_called_once_with('shadow/pr/1', 'new-head')
 
+    def test_source_becoming_ineligible_closes_only_the_mirror(self):
+        for changes in ({'draft': True}, {'base': {'ref': 'release'}}, {'state': 'closed'},
+                        {'user': {'type': 'User'}}):
+            for mode in ('sync', 'dry-run', 'export'):
+                with self.subTest(changes=changes, mode=mode):
+                    mirror = self.make_mirror(no_open_pr=mode == 'export')
+                    mirror.dry_run = mode == 'dry-run'
+                    mirror.mirrors[1] = {'state': 'open', 'number': 2}
+                    fixture = mirror.api.call.side_effect
+                    mirror.api.call.side_effect = lambda repo, path: dict(fixture(repo, path), **changes)
+                    result = mirror.sync(1)
+                    if mode == 'sync':
+                        self.assertEqual(result, {'status': 'closed'})
+                        mirror.api.write.assert_called_once_with('pulls/2', {'state': 'closed'}, 'PATCH')
+                    else:
+                        mirror.api.write.assert_not_called()
+                    mirror.commit.assert_not_called()
+
     def test_no_dependency_changes_closes_open_mirror_without_comment(self):
         for dry_run in (False, True):
             with self.subTest(dry_run=dry_run):

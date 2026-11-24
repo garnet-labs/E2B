@@ -298,16 +298,20 @@ class Mirror:
         api = self.api
         pr = api.call(SOURCE, f'pulls/{number}')
         existing = self.mirrors.get(number)
-        if pr['state'] != 'open':
-            if existing and existing['state'] == 'open' and not (self.dry_run or self.no_open_pr):
-                api.write(f'pulls/{existing["number"]}', {'state': 'closed'}, 'PATCH')
-            return {'status': 'closed' if existing else 'skipped'}
-        if pr['draft'] or pr['base']['ref'] != BRANCH:
-            return {'status': 'skipped'}
-        if not dependency_bot(pr):
-            return {'status': 'untrusted_author'}
-        upstream_base = self.merge_base(pr)
         open_mirror = existing if existing and existing['state'] == 'open' else None
+        ineligible = None
+        if pr['state'] != 'open' or pr['draft'] or pr['base']['ref'] != BRANCH:
+            ineligible = 'skipped'
+        elif not dependency_bot(pr):
+            ineligible = 'untrusted_author'
+        if ineligible:
+            if open_mirror and self.dry_run:
+                return {'status': 'dry-run', 'action': 'closed_ineligible'}
+            if open_mirror and not self.no_open_pr:
+                api.write(f'pulls/{open_mirror["number"]}', {'state': 'closed'}, 'PATCH')
+                return {'status': 'closed'}
+            return {'status': ineligible}
+        upstream_base = self.merge_base(pr)
         marker = MARKER.search(existing.get('body') or '') if existing else None
         rebased = bool(marker and marker[3] != upstream_base)
         base_branch, head_branch = self.branches(number, existing, new_revision=rebased)
