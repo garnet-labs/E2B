@@ -19,7 +19,7 @@ BRANCH = 'main'
 RECORDER = 'garnet-record.yml'
 WORKFLOW = f'.github/workflows/{RECORDER}'
 INSTALL_PATTERNS = (
-    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.tool-versions',
+    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml',
     *(f'packages/{package}/{manifest}'
       for package in ('python-sdk', 'code-interpreter-python', 'desktop-python')
       for manifest in ('pyproject.toml', 'uv.lock')),
@@ -97,7 +97,9 @@ def dependency_file(filename):
     } or bool(re.fullmatch(r'(?:requirements|constraints)[^/]*\.txt', name))
 
 
-def recorder_installs(filename, patterns, workspace):
+def recorder_installs(filename, patterns, workspace, transitions=()):
+    if filename == '.tool-versions':
+        return any(name in {'Node.js', 'python', 'uv'} for name, _, _ in transitions)
     if path_matches(filename, patterns):
         return True
     if not filename.endswith('/package.json') or 'package.json' not in patterns:
@@ -412,10 +414,11 @@ class Mirror:
             label = f'`{scrub_title(filename)}`'
             if previous:
                 label = f'`{scrub_title(previous)}` → {label}'
-            recorded = 'recorder installs' if recorder_installs(filename, self.patterns, workspace) else 'not installed by recorder'
-            lines.append(f'- {label} ({recorded})')
             manifest = filename if dependency_file(filename) else previous
-            for name, old, new in version_transitions(manifest, file.get('patch')):
+            transitions = version_transitions(manifest, file.get('patch'))
+            recorded = 'recorder installs' if recorder_installs(filename, self.patterns, workspace, transitions) else 'not installed by recorder'
+            lines.append(f'- {label} ({recorded})')
+            for name, old, new in transitions:
                 lines.append(f'  - {scrub_title(name)} {scrub_title(old)} → {scrub_title(new)}')
         lines.extend(['', f'Mirror base `{baseline}` → head `{head}`', '',
                       f'<!-- garnet-shadow-mirror upstream={number} upstream_head={pr["head"]["sha"]} upstream_base={upstream_base} -->'])

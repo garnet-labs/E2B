@@ -487,6 +487,21 @@ class DeferredPRTest(unittest.TestCase):
         self.assertIn('`.tool-versions` (recorder installs)', body)
         self.assertIn('Node.js 22.23.3 → 22.23.4', body)
 
+    def test_unused_tool_version_bumps_are_listed_without_install_claim(self):
+        for name, old, new in [('bun', '1.4.4', '1.4.5'), ('deno', '2.9.8', '2.9.9'),
+                               ('pnpm', '10.34.5', '10.34.6')]:
+            with self.subTest(name=name):
+                mirror = self.make_mirror()
+                mirror.patterns = INSTALL_PATTERNS
+                mirror.api.pages.return_value = [
+                    {'filename': '.tool-versions', 'patch': f'@@\n-{name} {old}\n+{name} {new}'},
+                ]
+                with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+                    result = mirror.sync(1)
+                    body = Path(result['body_file']).read_text()
+                self.assertIn('`.tool-versions` (not installed by recorder)', body)
+                self.assertIn(f'{name} {old} → {new}', body)
+
     def test_export_error_does_not_open_pr(self):
         mirror = self.make_mirror()
         with patch('mirror.Path') as path:
