@@ -533,6 +533,14 @@ class VersionsTest(unittest.TestCase):
         patch = ' catalog:\n-  "@types/node": "^22.20.5"\n+  "@types/node": "^22.20.6"'
         self.assertEqual(version_transitions('pnpm-workspace.yaml', patch), [('@types/node', '^22.20.5', '^22.20.6')])
 
+    def test_pnpm_workspace_catalog_bump_across_quote_styles(self):
+        for name, plain, double in [('vite', 'vite: ^{version}', '"vite": "^{version}"'),
+                                    ('@types/node', "'@types/node': '^{version}'", '"@types/node": "^{version}"')]:
+            for before, after in [(plain, double), (double, plain)]:
+                with self.subTest(before=before, after=after):
+                    patch = f" catalog:\n-  {before.format(version='1.0.0')}\n+  {after.format(version='1.0.1')}"
+                    self.assertEqual(version_transitions('pnpm-workspace.yaml', patch), [(name, '^1.0.0', '^1.0.1')])
+
     def test_pnpm_range_overrides(self):
         patch = (
             " overrides:\n"
