@@ -394,12 +394,16 @@ class Mirror:
             head = self.commit(tree, [parent], title)
             self.ref(head_branch, head)
         lines = ['Dependency files changed:', '']
-        for file in files:
-            if not dependency_file(file['filename']):
-                continue
-            recorded = 'recorder installs' if recorder_installs(file['filename'], self.patterns, workspace) else 'not installed by recorder'
-            lines.append(f'- `{scrub_title(file["filename"])}` ({recorded})')
-            for name, old, new in version_transitions(file['filename'], file.get('patch')):
+        for file in matched:
+            filename = file['filename']
+            previous = file.get('previous_filename')
+            label = f'`{scrub_title(filename)}`'
+            if previous:
+                label = f'`{scrub_title(previous)}` → {label}'
+            recorded = 'recorder installs' if recorder_installs(filename, self.patterns, workspace) else 'not installed by recorder'
+            lines.append(f'- {label} ({recorded})')
+            manifest = filename if dependency_file(filename) else previous
+            for name, old, new in version_transitions(manifest, file.get('patch')):
                 lines.append(f'  - {scrub_title(name)} {scrub_title(old)} → {scrub_title(new)}')
         lines.extend(['', f'Mirror base `{baseline}` → head `{head}`', '',
                       f'<!-- garnet-shadow-mirror upstream={number} upstream_head={pr["head"]["sha"]} upstream_base={upstream_base} -->'])

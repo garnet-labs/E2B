@@ -401,6 +401,14 @@ class DeferredPRTest(unittest.TestCase):
         mirror.commit.assert_called_once_with('head-tree', ['baseline'], 'Bump `@scope/name`')
         mirror.ref.assert_called_once_with('shadow/pr/1', 'new-head', force=True)
 
+    def test_renamed_manifest_is_reported_even_if_destination_is_not_a_manifest(self):
+        mirror = self.make_mirror()
+        mirror.api.pages.return_value = [{'filename': 'archived.json', 'previous_filename': 'package.json'}]
+        with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+            result = mirror.sync(1)
+            body = Path(result['body_file']).read_text()
+        self.assertIn('`package.json` → `archived.json` (not installed by recorder)', body)
+
     def test_force_update_is_blocked_by_any_open_pr(self):
         mirror = self.make_mirror()
         mirror.api.pages.return_value = [{'number': 2}]
