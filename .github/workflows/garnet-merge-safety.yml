@@ -36,15 +36,21 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
     steps:
+      - name: Check pull request base
+        id: base
+        run: gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"ref=" + .base.ref' >> "${GITHUB_OUTPUT}"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ !startsWith(steps.base.outputs.ref, 'shadow/base/') }}
         with:
           repository: garnet-labs/garnet-replay
           ref: 249608b
           persist-credentials: false
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: ${{ !startsWith(steps.base.outputs.ref, 'shadow/base/') }}
         with:
           node-version: 20
       - name: Merge decision from the head-bound record
+        if: ${{ !startsWith(steps.base.outputs.ref, 'shadow/base/') }}
         shell: bash
         run: |
           set -uo pipefail
