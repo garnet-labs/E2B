@@ -113,6 +113,8 @@ class DeferredPRTest(unittest.TestCase):
                 return {'object': {'sha': 'baseline'}}
             if path.startswith('git/ref/heads/shadow/pr/'):
                 return {'object': {'sha': 'head'}}
+            if path == 'git/commits/baseline':
+                return {'message': 'chore: shadow baseline\n\nShadow-Upstream-Base: source-merge-base'}
             if path == 'git/commits/head':
                 return {'tree': {'sha': 'head-tree'}, 'message': 'Bump pnpm', 'parents': [{'sha': 'baseline'}]}
             raise AssertionError((repo, path))
@@ -172,7 +174,7 @@ class DeferredPRTest(unittest.TestCase):
         mirror.commit.return_value = 'fresh-baseline'
         with self.assertRaises(BaselineUnavailable):
             mirror.sync(1)
-        mirror.commit.assert_called_once_with('head-tree', [], 'chore: shadow baseline')
+        mirror.commit.assert_called_once_with('head-tree', [], 'chore: shadow baseline\n\nShadow-Upstream-Base: source-merge-base')
         mirror.ref.assert_called_once_with('shadow/base/1-r2', 'fresh-baseline')
 
     def test_only_allowlisted_bots_with_upstream_heads_are_selected(self):
@@ -218,7 +220,7 @@ class DeferredPRTest(unittest.TestCase):
             mirror.sync(1)
         self.assertEqual(mirror.tree.call_args_list[0].args, ('source-merge-base',))
         mirror.api.call.assert_any_call(SOURCE, 'compare/source-base...source-head')
-        self.assertEqual(mirror.commit.call_args_list[0].args, ('head-tree', [], 'chore: shadow baseline'))
+        self.assertEqual(mirror.commit.call_args_list[0].args, ('head-tree', [], 'chore: shadow baseline\n\nShadow-Upstream-Base: source-merge-base'))
         self.assertEqual(mirror.commit.call_args_list[1].args, ('head-tree', ['new-baseline'], 'Bump pnpm'))
 
     def test_existing_pr_no_open_exports_marker_without_updating_pr(self):
@@ -264,6 +266,30 @@ class DeferredPRTest(unittest.TestCase):
         mirror.ref.assert_not_called()
         closed['head']['ref'] = 'shadow/pr/1-r2'
         self.assertEqual(mirror.branches(1, closed), ('shadow/base/1-r3', 'shadow/pr/1-r3'))
+
+    def test_rebased_source_does_not_reuse_an_old_prepared_pair(self):
+        mirror = self.make_mirror()
+        fixture = mirror.api.call.side_effect
+
+        def read(repo, path):
+            if path == 'git/commits/baseline':
+                return {'message': 'chore: shadow baseline\n\nShadow-Upstream-Base: previous-source-base'}
+            if path == 'git/ref/heads/shadow/pr/1-r2':
+                raise RuntimeError('HTTP 404: missing ref')
+            return fixture(repo, path)
+
+        mirror.api.call.side_effect = read
+        mirror.commit.side_effect = ['rebased-baseline', 'rebased-head']
+        with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+            result = mirror.sync(1)
+            body = Path(result['body_file']).read_text()
+        self.assertEqual(result['base_ref'], 'shadow/base/1-r2')
+        self.assertEqual(result['head_ref'], 'shadow/pr/1-r2')
+        self.assertIn('upstream_base=source-merge-base', body)
+        self.assertIn('Mirror base `rebased-baseline` → head `rebased-head`', body)
+        self.assertEqual(mirror.ref.call_args_list, [
+            call('shadow/base/1-r2', 'rebased-baseline'), call('shadow/pr/1-r2', 'rebased-head')
+        ])
 
     def test_base_force_update_is_always_rejected(self):
         mirror = self.make_mirror()

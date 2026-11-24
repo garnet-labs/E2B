@@ -25,6 +25,7 @@ INSTALL_PATTERNS = (
       for manifest in ('pyproject.toml', 'uv.lock')),
 )
 MARKER = re.compile(r'<!-- garnet-shadow-mirror upstream=(\d+) upstream_head=([a-f0-9]+) upstream_base=([a-f0-9]+) -->')
+BASELINE_MESSAGE = 'chore: shadow baseline\n\nShadow-Upstream-Base: {}'
 VERDICT = '<!-- garnet-shadow-mirror:verdict -->\n**HOLD**: The Garnet runtime record is not available for review yet.'
 DEPENDENCY_BOTS = {
     'dependabot[bot]': 49699333,
@@ -264,6 +265,16 @@ class Mirror:
                 revisions.append(int(match[1] or 1))
         return revisions
 
+    def fresh_pair(self, number, base_branch):
+        current_revision = int(base_branch.rsplit('-r', 1)[1]) if '-r' in base_branch else 1
+        revision = max([current_revision] + self.branch_revisions(number)) + 1
+        return f'shadow/base/{number}-r{revision}', f'shadow/pr/{number}-r{revision}'
+
+    def create_baseline(self, branch, upstream_base):
+        baseline = self.commit(self.tree(upstream_base), [], BASELINE_MESSAGE.format(upstream_base))
+        self.ref(branch, baseline)
+        return baseline
+
     def ref(self, name, sha, force=False):
         if force:
             if not name.startswith('shadow/pr/'):
@@ -364,8 +375,12 @@ class Mirror:
             except RuntimeError as error:
                 if 'HTTP 404:' not in str(error):
                     raise
-                baseline = self.commit(self.tree(upstream_base), [], 'chore: shadow baseline')
-                self.ref(base_branch, baseline)
+                baseline = self.create_baseline(base_branch, upstream_base)
+            else:
+                prepared = api.call(FORK, f'git/commits/{baseline}')
+                if prepared['message'] != BASELINE_MESSAGE.format(upstream_base):
+                    base_branch, head_branch = self.fresh_pair(number, base_branch)
+                    baseline = self.create_baseline(base_branch, upstream_base)
             parent = baseline
             try:
                 parent = api.call(FORK, f'git/ref/heads/{head_branch}')['object']['sha']
@@ -375,11 +390,8 @@ class Mirror:
         try:
             self.baseline_started(base_branch, baseline)
         except BaselineUnavailable:
-            current_revision = int(base_branch.rsplit('-r', 1)[1]) if '-r' in base_branch else 1
-            revision = max([current_revision] + self.branch_revisions(number)) + 1
-            base_branch, head_branch = f'shadow/base/{number}-r{revision}', f'shadow/pr/{number}-r{revision}'
-            baseline = self.commit(self.tree(upstream_base), [], 'chore: shadow baseline')
-            self.ref(base_branch, baseline)
+            base_branch, head_branch = self.fresh_pair(number, base_branch)
+            baseline = self.create_baseline(base_branch, upstream_base)
             parent, existing = baseline, None
             self.baseline_started(base_branch, baseline)
         title = scrub_title(pr['title'])
