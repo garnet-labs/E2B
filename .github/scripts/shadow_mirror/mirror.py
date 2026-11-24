@@ -114,6 +114,7 @@ def version_transitions(filename, patch):
     sides = {'-': {}, '+': {}}
     package = None
     pnpm = filename.endswith('pnpm-lock.yaml')
+    pnpm_workspace = filename.endswith('pnpm-workspace.yaml')
     package_lock = filename.endswith(('Cargo.lock', 'uv.lock', 'poetry.lock'))
     for line in (patch or '').splitlines():
         if line.startswith('@@'):
@@ -140,9 +141,11 @@ def version_transitions(filename, patch):
             match = re.match(r'version\s*=\s*"([^"]+)"', value)
             if match:
                 pair = (package, match[1])
-        elif pnpm:
-            match = re.match(r"['\"]?((?:@[\w.-]+/)?[\w.-]+)@([\w.+-]+)(?:\(|['\"]?:)", value)
-            if not match:
+        elif pnpm or pnpm_workspace:
+            match = re.fullmatch(r"""['"]?((?:@[\w.-]+/)?[\w.-]+@[^:'"]*[<>=][^:'"]*)['"]?:\s*['"]?([^'"#]+?)['"]?""", value)
+            if not match and pnpm:
+                match = re.match(r"['\"]?((?:@[\w.-]+/)?[\w.-]+)@([\w.+-]+)(?:\(|['\"]?:)", value)
+            if not match and pnpm:
                 match = re.match(r"['\"]?((?:@[\w.-]+/)?[\w.-]+)['\"]?:\s*['\"]?([~^]?\d[\w.+-]*)", value)
                 if match and match[1] in ('version', 'specifier'):
                     match = None
@@ -152,9 +155,9 @@ def version_transitions(filename, patch):
             match = re.match(r'(\S+)\s+(v\S+?)(?:/go.mod)?(?:\s|$)', value)
             if match:
                 pair = (match[1], match[2])
-        if not pair and not pnpm and not package_lock:
+        if not pair and not (pnpm or pnpm_workspace or package_lock):
             pair = re.match(r'"([^"\s]+)"\s*:\s*"([^"]+)"', value)
-        if not pair and not pnpm and not package_lock:
+        if not pair and not (pnpm or pnpm_workspace or package_lock):
             pair = re.match(r'["\']?([A-Za-z0-9_.-]+(?:\[[^\]]+\])?)\s*(?:=\s*["\']|(?=[<>=!~]))([^"\';]+)', value)
         if pair:
             name, version = (pair[1], pair[2]) if isinstance(pair, re.Match) else pair

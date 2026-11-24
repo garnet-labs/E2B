@@ -480,6 +480,16 @@ class VersionsTest(unittest.TestCase):
         patch = "-  '@scope/pkg@1.0.0':\n+  '@scope/pkg@2.0.0':\n-  lib@1.0.0:\n+  lib@2.0.0:\n-      '@scope/pkg': 1.0.0\n+      '@scope/pkg': 2.0.0"
         self.assertEqual(version_transitions('pnpm-lock.yaml', patch), [('@scope/pkg', '1.0.0', '2.0.0'), ('lib', '1.0.0', '2.0.0')])
 
+    def test_pnpm_range_overrides(self):
+        patch = (
+            " overrides:\n"
+            "-  rollup@>=4: '>=4.59.0'\n+  rollup@>=4: '>=4.60.0'\n"
+            "-  '@babel/core@>=7.0.0 <7.29.6': ^7.29.6\n+  '@babel/core@>=7.0.0 <7.29.6': ^7.29.7"
+        )
+        expected = [('@babel/core@>=7.0.0 <7.29.6', '^7.29.6', '^7.29.7'), ('rollup@>=4', '>=4.59.0', '>=4.60.0')]
+        for filename in ('pnpm-workspace.yaml', 'pnpm-lock.yaml'):
+            self.assertEqual(version_transitions(filename, patch), expected)
+
     def test_go_rust_python_locks_and_node(self):
         self.assertEqual(version_transitions('go.mod', '-example.com/lib v1.0.0\n+example.com/lib v2.0.0'), [('example.com/lib', 'v1.0.0', 'v2.0.0')])
         for filename in ['Cargo.lock', 'uv.lock']:
