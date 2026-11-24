@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
 
-from mirror import API, FORK, RECORDER, SOURCE, VERDICT, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
+from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, VERDICT, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
 
 
 class PathsTest(unittest.TestCase):
@@ -439,6 +439,19 @@ class DeferredPRTest(unittest.TestCase):
         path.assert_not_called()
         mirror.commit.assert_not_called()
         mirror.api.write.assert_not_called()
+
+    def test_replays_node_upgrade_using_the_recorders_version_file(self):
+        mirror = self.make_mirror()
+        mirror.patterns = INSTALL_PATTERNS
+        mirror.api.pages.return_value = [
+            {'filename': '.tool-versions', 'patch': '@@\n-nodejs 22.23.3\n+nodejs 22.23.4\n python 3.11'},
+            {'filename': 'codegen.Dockerfile'},
+        ]
+        with TemporaryDirectory() as directory, patch('mirror.Path', return_value=Path(directory)):
+            result = mirror.sync(1)
+            body = Path(result['body_file']).read_text()
+        self.assertIn('`.tool-versions` (recorder installs)', body)
+        self.assertIn('Node.js 22.23.3 → 22.23.4', body)
 
     def test_export_error_does_not_open_pr(self):
         mirror = self.make_mirror()

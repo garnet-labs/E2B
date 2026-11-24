@@ -19,7 +19,7 @@ BRANCH = 'main'
 RECORDER = 'garnet-record.yml'
 WORKFLOW = f'.github/workflows/{RECORDER}'
 INSTALL_PATTERNS = (
-    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml',
+    'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.tool-versions',
     *(f'packages/{package}/{manifest}'
       for package in ('python-sdk', 'code-interpreter-python', 'desktop-python')
       for manifest in ('pyproject.toml', 'uv.lock')),
@@ -85,6 +85,8 @@ def is_mirror(pr, number):
 
 
 def dependency_file(filename):
+    if filename == '.tool-versions':
+        return True
     name = filename.rsplit('/', 1)[-1]
     return name in {
         'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package-lock.json',
@@ -130,6 +132,10 @@ def version_transitions(filename, patch):
         pair = None
         if filename.endswith(('.node-version', '.nvmrc')):
             pair = ('Node.js', value)
+        elif filename == '.tool-versions':
+            match = re.fullmatch(r'([A-Za-z][\w-]*)\s+([^#]+?)(?:\s+#.*)?', value)
+            if match:
+                pair = ('Node.js' if match[1] == 'nodejs' else match[1], match[2])
         elif package_lock and package:
             match = re.match(r'version\s*=\s*"([^"]+)"', value)
             if match:
