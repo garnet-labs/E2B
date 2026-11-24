@@ -514,6 +514,10 @@ class VersionsTest(unittest.TestCase):
         patch = "-  '@scope/pkg@1.0.0':\n+  '@scope/pkg@2.0.0':\n-  lib@1.0.0:\n+  lib@2.0.0:\n-      '@scope/pkg': 1.0.0\n+      '@scope/pkg': 2.0.0"
         self.assertEqual(version_transitions('pnpm-lock.yaml', patch), [('@scope/pkg', '1.0.0', '2.0.0'), ('lib', '1.0.0', '2.0.0')])
 
+    def test_pnpm_workspace_double_quoted_catalog_entry(self):
+        patch = ' catalog:\n-  "@types/node": "^22.20.5"\n+  "@types/node": "^22.20.6"'
+        self.assertEqual(version_transitions('pnpm-workspace.yaml', patch), [('@types/node', '^22.20.5', '^22.20.6')])
+
     def test_pnpm_range_overrides(self):
         patch = (
             " overrides:\n"

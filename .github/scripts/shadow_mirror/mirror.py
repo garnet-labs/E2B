@@ -156,7 +156,7 @@ def version_transitions(filename, patch):
             match = re.match(r'(\S+)\s+(v\S+?)(?:/go.mod)?(?:\s|$)', value)
             if match:
                 pair = (match[1], match[2])
-        if not pair and not (pnpm or pnpm_workspace or package_lock):
+        if not pair and not (pnpm or package_lock):
             pair = re.match(r'"([^"\s]+)"\s*:\s*"([^"]+)"', value)
         if not pair and not (pnpm or pnpm_workspace or package_lock):
             pair = re.match(r'["\']?([A-Za-z0-9_.-]+(?:\[[^\]]+\])?)\s*(?:=\s*["\']|(?=[<>=!~]))([^"\';]+)', value)
