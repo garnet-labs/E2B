@@ -116,6 +116,9 @@ jobs:
     name: JS SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.js == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/js_sdk_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -124,6 +127,9 @@ jobs:
     name: Python SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/python_sdk_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -132,6 +138,9 @@ jobs:
     name: CLI Tests
     needs: changes
     if: ${{ needs.changes.outputs.cli == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/cli_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -140,6 +149,9 @@ jobs:
     name: Code Interpreter JS SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.code_interpreter_js == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/code_interpreter_js_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -148,6 +160,9 @@ jobs:
     name: Code Interpreter Python SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.code_interpreter_python == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/code_interpreter_python_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -156,6 +171,9 @@ jobs:
     name: Desktop JS SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.desktop_js == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/desktop_js_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -164,6 +182,9 @@ jobs:
     name: Desktop Python SDK Tests
     needs: changes
     if: ${{ needs.changes.outputs.desktop_python == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/desktop_python_tests.yml
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -172,12 +193,18 @@ jobs:
     name: Dockerfile Utils JS Tests
     needs: changes
     if: ${{ needs.changes.outputs.dockerfile_utils_js == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/dockerfile_utils_js_tests.yml
 
   dockerfile-utils-python-tests:
     name: Dockerfile Utils Python Tests
     needs: changes
     if: ${{ needs.changes.outputs.dockerfile_utils_python == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/dockerfile_utils_python_tests.yml
 
   status:

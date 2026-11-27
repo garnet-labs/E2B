@@ -29,7 +29,6 @@ INSTALL_PATTERNS = (
 )
 MARKER = re.compile(r'<!-- garnet-shadow-mirror upstream=(\d+) upstream_head=([a-f0-9]+) upstream_base=([a-f0-9]+) -->')
 BASELINE_MESSAGE = 'chore: shadow baseline\n\nShadow-Upstream-Base: {}'
-VERDICT = '<!-- garnet-shadow-mirror:verdict -->\n**HOLD**: The Garnet runtime record is not available for review yet.'
 DEPENDENCY_BOTS = {
     'dependabot[bot]': 49699333,
     'renovate[bot]': 29139614,
@@ -363,11 +362,6 @@ class Mirror:
             time.sleep(5)
         raise BaselineUnavailable('Baseline workflow did not start; head was not pushed')
 
-    def hold(self, mirror_number):
-        comments = self.api.pages(FORK, f'issues/{mirror_number}/comments')
-        if not any(comment['body'] == VERDICT for comment in comments):
-            self.api.write(f'issues/{mirror_number}/comments', {'body': VERDICT})
-
     def sync(self, number):
         api = self.api
         pr = api.call(SOURCE, f'pulls/{number}')
@@ -392,7 +386,6 @@ class Mirror:
         if existing and (existing['state'] != 'open' or rebased):
             existing = None
         if existing and marker and not (self.dry_run or self.no_open_pr) and marker.groups()[1:] == (pr['head']['sha'], upstream_base):
-            self.hold(existing['number'])
             return {'status': 'unchanged', 'url': existing['html_url']}
         files = api.pages(SOURCE, f'pulls/{number}/files')
         matched = [f for f in files if any(dependency_file(path) for path in changed_paths(f))]
@@ -493,7 +486,6 @@ class Mirror:
             result = api.write(f'pulls/{existing["number"]}', data, 'PATCH')
         else:
             result = api.write('pulls', dict(data, head=head_branch, base=base_branch))
-        self.hold(result['number'])
         if open_mirror and open_mirror['number'] != result['number']:
             api.write(f'pulls/{open_mirror["number"]}', {'state': 'closed'}, 'PATCH')
         return {'status': 'updated' if existing else 'created', 'url': result['html_url'], 'base': baseline, 'head': head}

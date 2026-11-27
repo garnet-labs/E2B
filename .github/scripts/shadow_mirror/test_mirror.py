@@ -7,7 +7,7 @@ from unittest.mock import Mock, call, patch
 
 import yaml
 
-from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, VERDICT, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
+from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
 
 
 class RecorderPermissionsTest(unittest.TestCase):
@@ -336,17 +336,16 @@ class DeferredPRTest(unittest.TestCase):
 
     def test_missing_pr_is_opened_without_new_commit(self):
         mirror = self.make_mirror(no_open_pr=False)
-        mirror.api.pages.side_effect = [[{'filename': 'package.json'}], []]
+        mirror.api.pages.side_effect = [[{'filename': 'package.json'}]]
         mirror.api.write.return_value = {'number': 2, 'html_url': 'https://example.com/mirror'}
         result = mirror.sync(1)
         self.assertEqual(result['status'], 'created')
-        open_pr, hold = mirror.api.write.call_args_list
+        open_pr, = mirror.api.write.call_args_list
         self.assertEqual(open_pr.args[0], 'pulls')
         self.assertEqual(open_pr.args[1]['head'], 'shadow/pr/1')
-        self.assertEqual(hold, call('issues/2/comments', {'body': VERDICT}))
         mirror.commit.assert_not_called()
 
-    def test_unchanged_mirror_recovers_missing_comment_without_duplicate(self):
+    def test_unchanged_mirror_does_not_write(self):
         mirror = self.make_mirror(no_open_pr=False)
         mirror.mirrors[1] = {'state': 'open', 'number': 2, 'html_url': 'https://example.com/mirror',
                              'body': '<!-- garnet-shadow-mirror upstream=1 upstream_head=abc upstream_base=def -->',
@@ -361,11 +360,9 @@ class DeferredPRTest(unittest.TestCase):
             return pr
 
         mirror.api.call.side_effect = read
-        mirror.api.pages.side_effect = [[], [{'body': VERDICT}]]
         self.assertEqual(mirror.sync(1)['status'], 'unchanged')
-        self.assertEqual(mirror.sync(1)['status'], 'unchanged')
-        self.assertEqual(mirror.api.pages.call_args_list, [call(FORK, 'issues/2/comments')] * 2)
-        mirror.api.write.assert_called_once_with('issues/2/comments', {'body': VERDICT})
+        mirror.api.pages.assert_not_called()
+        mirror.api.write.assert_not_called()
         mirror.ref.assert_not_called()
 
     def test_api_rejects_upstream_writes(self):
@@ -373,7 +370,7 @@ class DeferredPRTest(unittest.TestCase):
             api = API()
         with patch('mirror.urllib.request.urlopen') as urlopen:
             with self.assertRaisesRegex(ValueError, 'Writes are restricted'):
-                api.call(SOURCE, 'issues/1/comments', 'POST', {'body': VERDICT})
+                api.call(SOURCE, 'pulls/1', 'PATCH', {'state': 'closed'})
             urlopen.assert_not_called()
 
     def test_changed_tree_appends_commit(self):
