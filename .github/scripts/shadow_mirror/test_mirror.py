@@ -1,5 +1,6 @@
 import unittest
 import base64
+import datetime
 from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -109,6 +110,7 @@ class DeferredPRTest(unittest.TestCase):
         mirror.api = Mock()
         mirror.dry_run = False
         mirror.no_open_pr = no_open_pr
+        mirror.lookback_cutoff = datetime.datetime(2026, 11, 17, tzinfo=datetime.timezone.utc)
         mirror.mirrors = {}
         mirror.patterns = ['package.json']
         mirror.tree = Mock(return_value='head-tree')
@@ -365,6 +367,69 @@ class DeferredPRTest(unittest.TestCase):
         mirror.api.write.assert_not_called()
         mirror.ref.assert_not_called()
 
+    def test_manual_lookback_replays_an_older_merge(self):
+        mirror = self.make_mirror(no_open_pr=False)
+        pr = mirror.api.call(SOURCE, 'pulls/1')
+        pr.update(state='closed', merged_at='2026-10-16T00:00:00Z')
+        mirror.api.call.reset_mock()
+        read = mirror.api.call.side_effect
+        mirror.api.call.side_effect = lambda repo, path: pr if path == 'pulls/1' else read(repo, path)
+        mirror.api.write.return_value = {'number': 2, 'html_url': 'https://example.com/mirror'}
+
+        self.assertEqual(mirror.sync(1), {'status': 'skipped'})
+        mirror.api.write.assert_not_called()
+        mirror.lookback_cutoff = datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc)
+        self.assertEqual(mirror.sync(1)['status'], 'created')
+        mirror.api.call.assert_any_call(SOURCE, 'compare/source-base...source-head')
+        mirror.api.write.assert_called_once()
+        self.assertEqual(mirror.api.write.call_args.args[0], 'pulls')
+
+    def test_recently_opened_backfill_stays_open_under_default_lookback(self):
+        for merged_at, created_at, stays_open in (
+            ('2026-10-16T00:00:00Z', '2026-11-26T00:00:00Z', True),
+            ('2026-10-16T00:00:00Z', '2026-11-10T00:00:00Z', False),
+            (None, '2026-11-26T00:00:00Z', False),
+        ):
+            with self.subTest(merged_at=merged_at, created_at=created_at):
+                mirror = self.make_mirror(no_open_pr=False)
+                read = mirror.api.call.side_effect
+                mirror.mirrors[1] = {
+                    'state': 'open', 'number': 2, 'created_at': created_at,
+                    'html_url': 'https://example.com/mirror',
+                    'body': '<!-- garnet-shadow-mirror upstream=1 upstream_head=abc upstream_base=def -->',
+                    'base': {'ref': 'shadow/base/1'}, 'head': {'ref': 'shadow/pr/1'},
+                }
+
+                def call_source(repo, path):
+                    if path.startswith('compare/'):
+                        return {'merge_base_commit': {'sha': 'def'}}
+                    pr = read(repo, path)
+                    pr.update(state='closed', merged_at=merged_at)
+                    pr['head']['sha'] = 'abc'
+                    return pr
+
+                mirror.api.call.side_effect = call_source
+                mirror.api.pages.return_value = []
+                self.assertIn(1, mirror.candidates())
+                if stays_open:
+                    self.assertEqual(mirror.sync(1)['status'], 'unchanged')
+                    mirror.api.write.assert_not_called()
+                else:
+                    self.assertEqual(mirror.sync(1), {'status': 'closed'})
+                    mirror.api.write.assert_called_once_with('pulls/2', {'state': 'closed'}, 'PATCH')
+
+    def test_candidates_include_recent_merges_but_not_recent_unmerged_closures(self):
+        mirror = self.make_mirror()
+        trusted = mirror.api.call(SOURCE, 'pulls/1')
+        mirror.api.pages.side_effect = [
+            [{'number': 1}],
+            [dict(trusted, number=2, merged_at='2026-11-17T00:00:00Z'),
+             dict(trusted, number=3, merged_at=None),
+             dict(trusted, number=4, merged_at='2026-11-16T23:59:59Z'),
+             dict(trusted, number=5, merged_at='2026-11-26T00:00:00Z', user={'type': 'User'})],
+        ]
+        self.assertEqual(mirror.candidates(), [1, 2])
+
     def test_api_rejects_upstream_writes(self):
         with patch.dict('mirror.os.environ', {'SHADOW_MIRROR_TOKEN': 'fixture'}):
             api = API()
@@ -372,6 +437,17 @@ class DeferredPRTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Writes are restricted'):
                 api.call(SOURCE, 'pulls/1', 'PATCH', {'state': 'closed'})
             urlopen.assert_not_called()
+
+    def test_recent_candidate_discovery_stops_at_older_updated_prs(self):
+        cutoff = datetime.datetime(2026, 11, 17, tzinfo=datetime.timezone.utc)
+        recent = {'updated_at': '2026-11-18T00:00:00Z'}
+        old = {'updated_at': '2026-11-16T00:00:00Z'}
+        with patch.dict('mirror.os.environ', {'SHADOW_MIRROR_TOKEN': 'fixture'}):
+            api = API()
+        with patch.object(api, 'call', side_effect=[[recent] * 100, [recent] + [old] * 99]) as read:
+            result = api.pages(SOURCE, 'pulls?state=closed&sort=updated&direction=desc', updated_since=cutoff)
+        self.assertEqual(len(result), 101)
+        self.assertEqual(read.call_count, 2)
 
     def test_changed_tree_appends_commit(self):
         mirror = self.make_mirror()
