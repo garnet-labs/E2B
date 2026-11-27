@@ -45,7 +45,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
-      GARNET_REVIEWERS: "devin"
+      GARNET_REVIEWERS: ${{ github.repository == 'garnet-labs/E2B' && 'devin,greptile' || 'devin' }}
       GARNET_RECORD_WORKFLOWS: '["Dependency install and test (recorded)","Dependency install and test"]'
       DEVIN_API_TOKEN: ${{ secrets.DEVIN_API_TOKEN }}
       DEVIN_ORG_ID: ${{ vars.DEVIN_ORG_ID }}
@@ -66,8 +66,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shadow_pr=false
           if [ -n "${EVENT_PR_NUMBER}" ]; then
-            head=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${EVENT_PR_NUMBER}" --jq 'select(.state == "open" and (.base.ref | startswith("shadow/base/") | not)) | .head.sha')
+            pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${EVENT_PR_NUMBER}" --jq 'select(.state == "open") | [.head.sha, (.base.ref | startswith("shadow/base/"))] | @tsv')
+            IFS=$'\t' read -r head shadow_pr <<< "$pr"
             prs="${EVENT_PR_NUMBER}"
           else
             head="${EVENT_HEAD_SHA}"
@@ -75,8 +77,9 @@ jobs:
           fi
           echo "sha=${head}" >> "${GITHUB_OUTPUT}"
           echo "prs=${prs}" >> "${GITHUB_OUTPUT}"
+          echo "shadow_pr=${shadow_pr}" >> "${GITHUB_OUTPUT}"
       - name: Mirror into every open pull request at this head
-        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != '' && steps.head.outputs.shadow_pr != 'true'
         shell: bash
         env:
           HEAD_SHA: ${{ steps.head.outputs.sha }}
@@ -87,11 +90,14 @@ jobs:
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-mirror.mjs
           done
       - name: Request reviews once the record is bound (once per head)
-        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+        if: >-
+          steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+          && (steps.head.outputs.shadow_pr != 'true' || github.repository == 'garnet-labs/E2B')
         shell: bash
         env:
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           PRS: ${{ steps.head.outputs.prs }}
+          SHADOW_PR: ${{ steps.head.outputs.shadow_pr }}
         run: |
           set -euo pipefail
           for pr_number in ${PRS}; do

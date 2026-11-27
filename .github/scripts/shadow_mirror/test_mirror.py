@@ -25,6 +25,20 @@ class RecorderPermissionsTest(unittest.TestCase):
                 self.assertEqual(job['permissions'], {'contents': 'read', 'id-token': 'write'})
 
 
+class ReviewerWorkflowTest(unittest.TestCase):
+    def test_shadow_reviews_do_not_mirror_the_description(self):
+        path = Path(__file__).resolve().parents[2] / 'workflows' / 'garnet-evidence-mirror.yml'
+        workflow = yaml.load(path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+        job = workflow['jobs']['mirror']
+        steps = {step.get('name'): step for step in job['steps']}
+        mirror = steps['Mirror into every open pull request at this head']
+        rereview = steps['Request reviews once the record is bound (once per head)']
+        self.assertIn("&& steps.head.outputs.shadow_pr != 'true'", mirror['if'])
+        self.assertIn("steps.head.outputs.shadow_pr != 'true' || github.repository == 'garnet-labs/E2B'", rereview['if'])
+        self.assertEqual(rereview['env']['SHADOW_PR'], '${{ steps.head.outputs.shadow_pr }}')
+        self.assertIn("'devin,greptile'", job['env']['GARNET_REVIEWERS'])
+
+
 class PathsTest(unittest.TestCase):
     def test_recursive_and_direct(self):
         patterns = ['package.json', 'products/desktop/**/package.json']
@@ -66,7 +80,7 @@ class MirrorDiscoveryTest(unittest.TestCase):
     def discover(self, prs):
         api = Mock()
         workflow = b'on:\n  pull_request:\n  push:\n    branches: [main, "shadow/base/**"]\n'
-        api.call.return_value = {'content': base64.b64encode(workflow).decode()}
+        api.call.side_effect = [{'content': base64.b64encode(workflow).decode()}, {'tree': []}]
         api.pages.return_value = prs
         return Mirror(api)
 
@@ -77,7 +91,7 @@ class MirrorDiscoveryTest(unittest.TestCase):
 
     def test_only_the_trusted_recorder_is_copied_to_shadow_trees(self):
         mirror = self.discover([])
-        mirror.api.call.assert_called_once_with(FORK, f'contents/{WORKFLOW}?ref=main')
+        mirror.api.call.assert_has_calls([call(FORK, f'contents/{WORKFLOW}?ref=main'), call(FORK, 'git/trees/main')])
         mirror.api.call.side_effect = [
             {'tree': {'sha': 'upstream-tree'}},
             {'tree': [{'path': '.github', 'sha': 'upstream-github'}]},
@@ -89,6 +103,41 @@ class MirrorDiscoveryTest(unittest.TestCase):
             call('git/trees', {'base_tree': 'upstream-github', 'tree': [{'path': 'workflows', 'mode': '040000', 'type': 'tree', 'sha': 'workflows'}]}),
             call('git/trees', {'base_tree': 'upstream-tree', 'tree': [{'path': '.github', 'mode': '040000', 'type': 'tree', 'sha': 'github'}]}),
         ])
+
+    def test_replay_trees_use_reviewer_adapters_from_mirror_main(self):
+        api = Mock()
+        adapters = [
+            {'path': name, 'mode': mode, 'type': kind, 'sha': f'main-{name}'}
+            for name, mode, kind in (
+                ('REVIEW.md', '100644', 'blob'), ('greptile.json', '100644', 'blob'),
+                ('.coderabbit.yaml', '100644', 'blob'), ('.pr_agent.toml', '100644', 'blob'),
+                ('.devin', '040000', 'tree'), ('.agents', '040000', 'tree'),
+            )
+        ]
+        responses = {
+            f'contents/{WORKFLOW}?ref=main': {'content': base64.b64encode(b'name: Recorder\n').decode()},
+            'git/trees/main': {'tree': adapters + [
+                {'path': 'package.json', 'mode': '100644', 'type': 'blob', 'sha': 'main-package'},
+            ]},
+        }
+        for side in ('base', 'head'):
+            responses[f'git/commits/upstream-{side}'] = {'tree': {'sha': f'upstream-{side}-tree'}}
+            responses[f'git/trees/upstream-{side}-tree'] = {'tree': [
+                {'path': '.github', 'sha': f'upstream-{side}-github'},
+                {'path': 'REVIEW.md', 'sha': f'upstream-{side}-review'},
+            ]}
+        api.call.side_effect = lambda repo, path: responses[path]
+        api.pages.return_value = []
+        api.write.side_effect = [{'sha': sha} for sha in ('workflows', 'base-github', 'base-tree',
+                                                         'workflows', 'head-github', 'head-tree')]
+        mirror = Mirror(api)
+        self.assertEqual(mirror.tree('upstream-base'), 'base-tree')
+        self.assertEqual(mirror.tree('upstream-head'), 'head-tree')
+        for i, side in ((2, 'base'), (5, 'head')):
+            self.assertEqual(api.write.call_args_list[i], call('git/trees', {
+                'base_tree': f'upstream-{side}-tree',
+                'tree': [{'path': '.github', 'mode': '040000', 'type': 'tree', 'sha': f'{side}-github'}, *adapters],
+            }))
 
     def test_spoofed_marker_is_ignored(self):
         for side, key, value in [('head', 'repo', {'full_name': 'other/repository'}),

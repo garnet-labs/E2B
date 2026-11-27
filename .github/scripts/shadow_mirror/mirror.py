@@ -20,6 +20,7 @@ SOURCE = 'e2b-dev/E2B'
 BRANCH = 'main'
 RECORDER = 'garnet-record.yml'
 WORKFLOW = f'.github/workflows/{RECORDER}'
+REVIEWER_ADAPTERS = frozenset({'.agents', '.coderabbit.yaml', '.devin', '.pr_agent.toml', 'REVIEW.md', 'greptile.json'})
 WORKSPACE_MANIFEST = 'pnpm-workspace.yaml'
 INSTALL_PATTERNS = (
     'package.json', 'pnpm-lock.yaml', WORKSPACE_MANIFEST,
@@ -246,6 +247,11 @@ class Mirror:
         self.api, self.dry_run, self.no_open_pr = api, dry_run, no_open_pr
         content = api.call(FORK, f'contents/{WORKFLOW}?ref={BRANCH}')
         self.workflow = base64.b64decode(content['content']).decode()
+        main_entries = api.call(FORK, f'git/trees/{BRANCH}')['tree']
+        self.reviewer_adapters = [
+            {key: entry[key] for key in ('path', 'mode', 'type', 'sha')}
+            for entry in main_entries if entry['path'] in REVIEWER_ADAPTERS
+        ]
         self.patterns = INSTALL_PATTERNS
         self.mirrors = {}
         self.history = {}
@@ -268,7 +274,10 @@ class Mirror:
         if github:
             data['base_tree'] = github
         github = api.write('git/trees', data)['sha']
-        return api.write('git/trees', {'base_tree': root, 'tree': [{'path': '.github', 'mode': '040000', 'type': 'tree', 'sha': github}]})['sha']
+        return api.write('git/trees', {
+            'base_tree': root,
+            'tree': [{'path': '.github', 'mode': '040000', 'type': 'tree', 'sha': github}, *self.reviewer_adapters],
+        })['sha']
 
     def commit(self, tree, parents, message):
         return self.api.write('git/commits', {'tree': tree, 'parents': parents, 'message': message})['sha']

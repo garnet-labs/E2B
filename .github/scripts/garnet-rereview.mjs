@@ -45,6 +45,7 @@ const api = process.env.GITHUB_API_URL || "https://api.github.com"
 const repo = process.env.GITHUB_REPOSITORY
 const prNumber = process.env.PR_NUMBER
 const headSha = process.env.HEAD_SHA
+const shadowPR = process.env.SHADOW_PR === "true"
 
 async function github(path, init = {}) {
   const res = await fetch(`${api}${path}`, {
@@ -111,7 +112,7 @@ export function isFinalizedRecordFor(comment, head) {
   if (summary === null) return false
   try {
     const parsed = JSON.parse(summary[1])
-    return parsed !== null && typeof parsed === "object" && (parsed.status === undefined || parsed.status === "finalized")
+    return parsed !== null && typeof parsed === "object" && (parsed.status === "finalized" || (!shadowPR && parsed.status === undefined))
   } catch {
     return false
   }
@@ -137,12 +138,15 @@ export function alreadyRequestedFor(comments, head) {
 export function renderRequestComment(reviewers, head) {
   const sha7 = head.slice(0, 7)
   const lines = reviewers.filter((name) => name in MENTIONS).map((name) => MENTIONS[name])
+  const recordLocation = shadowPR
+    ? "Read the Runtime Review comment by the Garnet App, not the PR description."
+    : "The record is in the description between `<!-- garnet:evidence:begin -->` and `<!-- garnet:evidence:end -->`."
   return [
     rereviewMarker(head),
     ...lines,
     "",
     `Runtime evidence for head \`${sha7}\` is bound to this pull request; requesting review again so it is read with the record present.`,
-    `The record is in the description between \`<!-- garnet:evidence:begin -->\` and \`<!-- garnet:evidence:end -->\`. When its \`garnet:commit\` equals \`${sha7}\`, prefix each runtime-grounded statement with \`Runtime evidence (Garnet, head ${sha7}):\` and name the job and destination it shows; otherwise say the runtime evidence is undeterminable. Judgment stays with you; the record is evidence, not a verdict. See REVIEW.md.`,
+    `${recordLocation} When its \`garnet:commit\` equals \`${shadowPR ? head : sha7}\`, prefix each runtime-grounded statement with \`Runtime evidence (Garnet, head ${sha7}):\` and name the job and destination it shows; otherwise say the runtime evidence is undeterminable. Judgment stays with you; the record is evidence, not a verdict. See REVIEW.md.`,
   ].join("\n")
 }
 
