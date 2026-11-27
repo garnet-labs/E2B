@@ -79,6 +79,7 @@ jobs:
           echo "prs=${prs}" >> "${GITHUB_OUTPUT}"
           echo "shadow_pr=${shadow_pr}" >> "${GITHUB_OUTPUT}"
       - name: Mirror into every open pull request at this head
+        id: mirror_description
         if: steps.head.outputs.sha != '' && steps.head.outputs.prs != '' && steps.head.outputs.shadow_pr != 'true'
         shell: bash
         env:
@@ -90,6 +91,7 @@ jobs:
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-mirror.mjs
           done
       - name: Request reviews once the record is bound (once per head)
+        id: rereview
         if: >-
           steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
           && (steps.head.outputs.shadow_pr != 'true' || github.repository == 'garnet-labs/E2B')
@@ -103,3 +105,12 @@ jobs:
           for pr_number in ${PRS}; do
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-rereview.mjs
           done
+      - name: Report skipped shadow re-review
+        if: >-
+          ${{ !cancelled() && github.repository == 'garnet-labs/E2B'
+              && steps.head.outputs.shadow_pr == 'true'
+              && steps.mirror_description.outcome == 'skipped'
+              && steps.rereview.outcome == 'skipped' }}
+        run: |
+          echo "::error::An open shadow PR resolved from a Garnet App comment, but no re-review step ran."
+          exit 1

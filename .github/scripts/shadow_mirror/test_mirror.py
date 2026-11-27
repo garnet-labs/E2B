@@ -37,6 +37,12 @@ class ReviewerWorkflowTest(unittest.TestCase):
         self.assertIn("steps.head.outputs.shadow_pr != 'true' || github.repository == 'garnet-labs/E2B'", rereview['if'])
         self.assertEqual(rereview['env']['SHADOW_PR'], '${{ steps.head.outputs.shadow_pr }}')
         self.assertIn("'devin,greptile'", job['env']['GARNET_REVIEWERS'])
+        guard = steps['Report skipped shadow re-review']
+        self.assertIn("steps.head.outputs.shadow_pr == 'true'", guard['if'])
+        for step in (mirror, rereview):
+            self.assertIn(f"steps.{step['id']}.outcome == 'skipped'", guard['if'])
+        self.assertIn('::error::', guard['run'])
+        self.assertIn('exit 1', guard['run'])
 
 
 class PathsTest(unittest.TestCase):
