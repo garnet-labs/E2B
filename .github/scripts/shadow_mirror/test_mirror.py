@@ -7,7 +7,67 @@ from unittest.mock import Mock, call, patch
 
 import yaml
 
-from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, VERDICT, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
+from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
+from verdict import MARKER as VERDICT_MARKER, render, review
+
+HEAD = 'a' * 40
+BASE = 'b' * 40
+VERDICT = render(FORK, 2, HEAD)
+
+
+def mirror_pr(head=HEAD):
+    return {'state': 'open', 'body': '<!-- garnet-shadow-mirror upstream=1 upstream_head=abc upstream_base=def -->',
+            'head': {'repo': {'full_name': FORK}, 'ref': 'shadow/pr/1', 'sha': head},
+            'base': {'repo': {'full_name': FORK}, 'ref': 'shadow/base/1'}}
+
+
+def finalized_record():
+    return {'status': 'finalized', 'bound_to_head': True, 'head_sha': HEAD, 'marker_commit': HEAD,
+            'result': 'unchanged', 'capture_quality': 'best-effort',
+            'comment_url': f'https://github.com/{FORK}/pull/2#issuecomment-42',
+            'envelope': {'incomplete': 0, 'previous': BASE}}
+
+
+class VerdictTest(unittest.TestCase):
+    def test_finalized_comparison_and_capture_are_required_for_pass(self):
+        record = finalized_record()
+        self.assertIn('**PASS**: nothing new recorded against bbbbbbb, best-effort capture', render(FORK, 2, HEAD, record))
+        for field, value in [('marker_commit', BASE), ('head_sha', BASE), ('bound_to_head', False),
+                             ('capture_quality', 'partial'), ('status', 'recording'),
+                             ('envelope', {'previous': BASE, 'incomplete': 1}),
+                             ('envelope', {'previous': 'missing', 'incomplete': 0})]:
+            with self.subTest(field=field, value=value):
+                self.assertEqual(render(FORK, 2, HEAD, dict(record, **{field: value})), VERDICT)
+
+    def test_changed_keeps_signed_app_rows_inert_and_first_stays_hold(self):
+        record = finalized_record()
+        record['result'] = 'changed'
+        body = render(FORK, 2, HEAD, record, app_comment=lambda _: {
+            'user': {'login': 'garnet-runtime-review[bot]'},
+            'body': f'<!-- garnet-runtime-review -->\n<!-- garnet:commit {HEAD} -->\n+ job → node → @reviewer\n- job → uv → old',
+        })
+        self.assertIn('**HOLD**: runtime behavior changed; ask a human', body)
+        self.assertIn('` + job → node → @reviewer `\n` - job → uv → old `', body)
+        self.assertIn('**HOLD**: nothing to compare yet', render(FORK, 2, HEAD, dict(record, result='first')))
+
+    def test_only_unknown_tool_falls_back_with_exact_pr_arguments(self):
+        with patch('verdict.tool_call', side_effect=[None, {'determinable': False}]) as rpc, patch('builtins.print'):
+            self.assertEqual(review(FORK, 2), ({'determinable': False}, 'outcome'))
+        arguments = {'githubOrg': 'garnet-labs', 'repo': 'E2B', 'pullNumber': 2}
+        self.assertEqual(rpc.call_args_list, [call('pr_review', arguments), call('outcome', arguments)])
+        with patch('verdict.tool_call', side_effect=TimeoutError) as rpc:
+            self.assertEqual(review(FORK, 2), ({}, 'pr_review'))
+            rpc.assert_called_once_with('pr_review', arguments)
+
+    def test_existing_comment_is_patched_and_moved_head_cannot_pass(self):
+        mirror = Mirror.__new__(Mirror)
+        mirror.api = Mock()
+        mirror.api.call.side_effect = [mirror_pr(), mirror_pr(BASE)]
+        mirror.api.pages.return_value = [{'id': 42, 'user': {'login': 'owner'}, 'body': VERDICT_MARKER}]
+        mirror.api.request.return_value = {'login': 'owner'}
+        with patch('verdict.review', return_value=(finalized_record(), 'pr_review')):
+            mirror.refresh_verdict(2, existing_only=True)
+        mirror.api.write.assert_called_once_with('issues/comments/42', {'body': render(FORK, 2, BASE)}, 'PATCH')
 
 
 class RecorderPermissionsTest(unittest.TestCase):
@@ -126,6 +186,8 @@ class DeferredPRTest(unittest.TestCase):
                 return {'state': 'open', 'draft': False, 'author_association': 'CONTRIBUTOR',
                         'user': {'type': 'Bot', 'login': 'dependabot[bot]', 'id': 49699333}, 'base': {'ref': 'main', 'sha': 'source-base'},
                         'head': {'sha': 'source-head', 'repo': {'full_name': SOURCE}}, 'title': 'Bump pnpm'}
+            if path == 'pulls/2':
+                return mirror_pr()
             if path.startswith('git/ref/heads/shadow/base/'):
                 return {'object': {'sha': 'baseline'}}
             if path.startswith('git/ref/heads/shadow/pr/'):
@@ -338,7 +400,8 @@ class DeferredPRTest(unittest.TestCase):
         mirror = self.make_mirror(no_open_pr=False)
         mirror.api.pages.side_effect = [[{'filename': 'package.json'}], []]
         mirror.api.write.return_value = {'number': 2, 'html_url': 'https://example.com/mirror'}
-        result = mirror.sync(1)
+        with patch('verdict.review', return_value=({}, 'pr_review')):
+            result = mirror.sync(1)
         self.assertEqual(result['status'], 'created')
         open_pr, hold = mirror.api.write.call_args_list
         self.assertEqual(open_pr.args[0], 'pulls')
@@ -357,13 +420,16 @@ class DeferredPRTest(unittest.TestCase):
             if path.startswith('compare/'):
                 return {'merge_base_commit': {'sha': 'def'}}
             pr = initial_call(repo, path)
-            pr['head']['sha'] = 'abc'
+            if repo == SOURCE:
+                pr['head']['sha'] = 'abc'
             return pr
 
         mirror.api.call.side_effect = read
-        mirror.api.pages.side_effect = [[], [{'body': VERDICT}]]
-        self.assertEqual(mirror.sync(1)['status'], 'unchanged')
-        self.assertEqual(mirror.sync(1)['status'], 'unchanged')
+        mirror.api.pages.side_effect = [[], [{'id': 42, 'body': VERDICT, 'user': {'login': 'owner'}}]]
+        mirror.api.request.return_value = {'login': 'owner'}
+        with patch('verdict.review', return_value=({}, 'pr_review')):
+            self.assertEqual(mirror.sync(1)['status'], 'unchanged')
+            self.assertEqual(mirror.sync(1)['status'], 'unchanged')
         self.assertEqual(mirror.api.pages.call_args_list, [call(FORK, 'issues/2/comments')] * 2)
         mirror.api.write.assert_called_once_with('issues/2/comments', {'body': VERDICT})
         mirror.ref.assert_not_called()

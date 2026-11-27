@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 import yaml
+import verdict
 
 FORK = 'garnet-labs/E2B'
 SOURCE = 'e2b-dev/E2B'
@@ -29,7 +30,6 @@ INSTALL_PATTERNS = (
 )
 MARKER = re.compile(r'<!-- garnet-shadow-mirror upstream=(\d+) upstream_head=([a-f0-9]+) upstream_base=([a-f0-9]+) -->')
 BASELINE_MESSAGE = 'chore: shadow baseline\n\nShadow-Upstream-Base: {}'
-VERDICT = '<!-- garnet-shadow-mirror:verdict -->\n**HOLD**: The Garnet runtime record is not available for review yet.'
 DEPENDENCY_BOTS = {
     'dependabot[bot]': 49699333,
     'renovate[bot]': 29139614,
@@ -216,8 +216,11 @@ class API:
     def call(self, repo, path, method='GET', data=None):
         if method != 'GET' and repo != FORK:
             raise ValueError('Writes are restricted to the mirror repository')
+        return self.request(f'repos/{repo}/{path}', method, data)
+
+    def request(self, path, method='GET', data=None):
         request = urllib.request.Request(
-            f'https://api.github.com/repos/{repo}/{path}',
+            f'https://api.github.com/{path}',
             data=json.dumps(data).encode() if data is not None else None,
             headers={'Authorization': f'Bearer {self.token}', 'Accept': 'application/vnd.github+json',
                      'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'}, method=method)
@@ -363,10 +366,42 @@ class Mirror:
             time.sleep(5)
         raise BaselineUnavailable('Baseline workflow did not start; head was not pushed')
 
-    def hold(self, mirror_number):
-        comments = self.api.pages(FORK, f'issues/{mirror_number}/comments')
-        if not any(comment['body'] == VERDICT for comment in comments):
-            self.api.write(f'issues/{mirror_number}/comments', {'body': VERDICT})
+    def refresh_verdict(self, mirror_number, existing_only=False):
+        path = f'pulls/{mirror_number}'
+
+        def current_head():
+            pr = self.api.call(FORK, path)
+            marker = MARKER.search(pr.get('body') or '')
+            if pr['state'] != 'open' or not marker or not is_mirror(pr, int(marker[1])):
+                raise ValueError('Not an open dependency mirror')
+            head = pr['head']['sha']
+            if not verdict.SHA.fullmatch(head):
+                raise ValueError('Invalid mirror head')
+            return head
+
+        head = current_head()
+        comment_path = f'issues/{mirror_number}/comments'
+        marked = [comment for comment in self.api.pages(FORK, comment_path)
+                  if (comment.get('body') or '').startswith(verdict.MARKER)]
+        if len(marked) > 1 or (existing_only and not marked):
+            raise ValueError('Expected one existing verdict comment')
+        old = marked[0] if marked else None
+        if old and old['user']['login'] != self.api.request('user')['login']:
+            raise ValueError('Verdict comment is not owned by the mirror credential')
+        record, source = verdict.review(FORK, mirror_number)
+        body = verdict.render(FORK, mirror_number, head, record, source,
+                              lambda comment_id: self.api.call(FORK, f'issues/comments/{comment_id}'))
+        latest = current_head()
+        if latest != head:
+            body = verdict.render(FORK, mirror_number, latest)
+        try:
+            if old is None:
+                self.api.write(comment_path, {'body': body})
+            elif old['body'] != body:
+                self.api.write(f'issues/comments/{old["id"]}', {'body': body}, 'PATCH')
+        except RuntimeError:
+            raise RuntimeError('Unable to publish the mirror verdict comment') from None
+        return {'status': 'verdict', 'result': body.splitlines()[1]}
 
     def sync(self, number):
         api = self.api
@@ -392,7 +427,7 @@ class Mirror:
         if existing and (existing['state'] != 'open' or rebased):
             existing = None
         if existing and marker and not (self.dry_run or self.no_open_pr) and marker.groups()[1:] == (pr['head']['sha'], upstream_base):
-            self.hold(existing['number'])
+            self.refresh_verdict(existing['number'])
             return {'status': 'unchanged', 'url': existing['html_url']}
         files = api.pages(SOURCE, f'pulls/{number}/files')
         matched = [f for f in files if any(dependency_file(path) for path in changed_paths(f))]
@@ -493,7 +528,7 @@ class Mirror:
             result = api.write(f'pulls/{existing["number"]}', data, 'PATCH')
         else:
             result = api.write('pulls', dict(data, head=head_branch, base=base_branch))
-        self.hold(result['number'])
+        self.refresh_verdict(result['number'])
         if open_mirror and open_mirror['number'] != result['number']:
             api.write(f'pulls/{open_mirror["number"]}', {'state': 'closed'}, 'PATCH')
         return {'status': 'updated' if existing else 'created', 'url': result['html_url'], 'base': baseline, 'head': head}
@@ -507,9 +542,11 @@ def main():
     sync.add_argument('--since-hours', type=float)
     sync.add_argument('--dry-run', action='store_true')
     sync.add_argument('--no-open-pr', action='store_true')
+    refresh = sub.add_parser('refresh-verdict')
+    refresh.add_argument('--pr', type=int, action='append', required=True)
     args = parser.parse_args()
     api = API()
-    mirror = Mirror(api, args.dry_run, args.no_open_pr)
+    mirror = Mirror(api, getattr(args, 'dry_run', False), getattr(args, 'no_open_pr', False))
     numbers = args.pr
     if not numbers:
         cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=args.since_hours)
@@ -520,7 +557,7 @@ def main():
     failed = False
     for number in numbers:
         try:
-            result = mirror.sync(number)
+            result = mirror.refresh_verdict(number, existing_only=True) if args.command == 'refresh-verdict' else mirror.sync(number)
         except Exception as error:
             result = {'status': 'error', 'error': str(error)}
             failed = True
