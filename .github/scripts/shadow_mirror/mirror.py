@@ -381,13 +381,18 @@ class Mirror:
 
         head = current_head()
         comment_path = f'issues/{mirror_number}/comments'
-        marked = [comment for comment in self.api.pages(FORK, comment_path)
-                  if (comment.get('body') or '').startswith(verdict.MARKER)]
-        if len(marked) > 1 or (existing_only and not marked):
+        marked = sorted((comment for comment in self.api.pages(FORK, comment_path)
+                         if (comment.get('body') or '').startswith(verdict.MARKER)), key=lambda comment: comment['id'])
+        if existing_only and not marked:
             raise ValueError('Expected one existing verdict comment')
         old = marked[0] if marked else None
-        if old and old['user']['login'] != self.api.request('user')['login']:
-            raise ValueError('Verdict comment is not owned by the mirror credential')
+        duplicates = marked[1:]
+        if old:
+            author = self.api.request('user')['login']
+            if any(comment['user']['login'] != author for comment in marked):
+                raise ValueError('Verdict comment is not owned by the mirror credential')
+            if any(comment['body'] != verdict.LEGACY_HOLD for comment in duplicates):
+                raise ValueError('Multiple non-legacy verdict comments')
         record, source = verdict.review(FORK, mirror_number)
         body = verdict.render(FORK, mirror_number, head, record, source,
                               lambda comment_id: self.api.call(FORK, f'issues/comments/{comment_id}'))
@@ -399,6 +404,8 @@ class Mirror:
                 self.api.write(comment_path, {'body': body})
             elif old['body'] != body:
                 self.api.write(f'issues/comments/{old["id"]}', {'body': body}, 'PATCH')
+            for duplicate in duplicates:
+                self.api.write(f'issues/comments/{duplicate["id"]}', None, 'DELETE')
         except RuntimeError:
             raise RuntimeError('Unable to publish the mirror verdict comment') from None
         return {'status': 'verdict', 'result': body.splitlines()[1]}

@@ -5,6 +5,7 @@ import urllib.request
 
 MCP = 'https://api.garnet.ai/api/v2/mcp'
 MARKER = '<!-- garnet-shadow-mirror:verdict -->'
+LEGACY_HOLD = f'{MARKER}\n**HOLD**: The Garnet runtime record is not available for review yet.'
 SHA = re.compile(r'[0-9a-f]{40}')
 APP_AUTHORS = {'garnet-runtime-review[bot]', 'garnet-runtime-review-dev[bot]', 'garnet-ai[bot]'}
 

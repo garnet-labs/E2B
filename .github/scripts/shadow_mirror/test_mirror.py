@@ -8,7 +8,7 @@ from unittest.mock import Mock, call, patch
 import yaml
 
 from mirror import API, FORK, INSTALL_PATTERNS, RECORDER, SOURCE, WORKFLOW, BaselineUnavailable, Mirror, dependency_file, path_matches, recorder_installs, scrub_title, version_transitions
-from verdict import MARKER as VERDICT_MARKER, render, review
+from verdict import LEGACY_HOLD, MARKER as VERDICT_MARKER, render, review
 
 HEAD = 'a' * 40
 BASE = 'b' * 40
@@ -68,6 +68,23 @@ class VerdictTest(unittest.TestCase):
         with patch('verdict.review', return_value=(finalized_record(), 'pr_review')):
             mirror.refresh_verdict(2, existing_only=True)
         mirror.api.write.assert_called_once_with('issues/comments/42', {'body': render(FORK, 2, BASE)}, 'PATCH')
+
+    def test_legacy_duplicate_is_removed_after_patching_original(self):
+        mirror = Mirror.__new__(Mirror)
+        mirror.api = Mock()
+        mirror.api.call.return_value = mirror_pr()
+        mirror.api.pages.return_value = [
+            {'id': 99, 'user': {'login': 'owner'}, 'body': LEGACY_HOLD},
+            {'id': 42, 'user': {'login': 'owner'}, 'body': VERDICT},
+        ]
+        mirror.api.request.return_value = {'login': 'owner'}
+        record = finalized_record()
+        with patch('verdict.review', return_value=(record, 'pr_review')):
+            mirror.refresh_verdict(2, existing_only=True)
+        self.assertEqual(mirror.api.write.call_args_list, [
+            call('issues/comments/42', {'body': render(FORK, 2, HEAD, record)}, 'PATCH'),
+            call('issues/comments/99', None, 'DELETE'),
+        ])
 
 
 class RecorderPermissionsTest(unittest.TestCase):
