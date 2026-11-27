@@ -18,6 +18,7 @@ import yaml
 FORK = 'garnet-labs/E2B'
 SOURCE = 'e2b-dev/E2B'
 BRANCH = 'main'
+LOOKBACK_DAYS = 10
 RECORDER = 'garnet-record.yml'
 WORKFLOW = f'.github/workflows/{RECORDER}'
 WORKSPACE_MANIFEST = 'pnpm-workspace.yaml'
@@ -82,6 +83,16 @@ def dependency_bot(pr):
     bot_id = DEPENDENCY_BOTS.get(author.get('login'))
     return bool(bot_id and author.get('id') == bot_id and author.get('type') == 'Bot'
                 and (pr['head'].get('repo') or {}).get('full_name') == SOURCE)
+
+
+def within_lookback(timestamp, cutoff):
+    return bool(timestamp and datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00')) >= cutoff)
+
+
+def recently_merged(pr, cutoff, open_mirror=None):
+    merged_at = pr.get('merged_at')
+    return bool(merged_at and (within_lookback(merged_at, cutoff)
+                              or within_lookback((open_mirror or {}).get('created_at'), cutoff)))
 
 
 def is_mirror(pr, number):
@@ -227,11 +238,17 @@ class API:
         except urllib.error.HTTPError as error:
             raise RuntimeError(f'{method} {path}: HTTP {error.code}: {error.read().decode()}') from error
 
-    def pages(self, repo, path):
+    def pages(self, repo, path, updated_since=None):
         result = []
         for page in range(1, 1000):
             items = self.call(repo, f'{path}{"&" if "?" in path else "?"}per_page=100&page={page}')
-            result.extend(items)
+            if updated_since is None:
+                result.extend(items)
+            else:
+                for item in items:
+                    if not within_lookback(item['updated_at'], updated_since):
+                        return result
+                    result.append(item)
             if len(items) < 100:
                 return result
         raise RuntimeError('Pagination limit reached')
@@ -241,8 +258,9 @@ class API:
 
 
 class Mirror:
-    def __init__(self, api, dry_run=False, no_open_pr=False):
+    def __init__(self, api, dry_run=False, no_open_pr=False, lookback_days=LOOKBACK_DAYS):
         self.api, self.dry_run, self.no_open_pr = api, dry_run, no_open_pr
+        self.lookback_cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)
         content = api.call(FORK, f'contents/{WORKFLOW}?ref={BRANCH}')
         self.workflow = base64.b64decode(content['content']).decode()
         self.patterns = INSTALL_PATTERNS
@@ -255,6 +273,18 @@ class Mirror:
                 self.history.setdefault(number, []).append(pr)
                 if number not in self.mirrors or pr['number'] > self.mirrors[number]['number']:
                     self.mirrors[number] = pr
+
+    def candidates(self, since_hours=None):
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=since_hours)
+                  if since_hours is not None else None)
+        numbers = [pr['number'] for pr in self.api.pages(SOURCE, f'pulls?state=open&base={BRANCH}&sort=created&direction=desc')
+                   if cutoff is None or within_lookback(pr['created_at'], cutoff)]
+        closed = self.api.pages(SOURCE, f'pulls?state=closed&base={BRANCH}&sort=updated&direction=desc',
+                                updated_since=self.lookback_cutoff)
+        numbers.extend(pr['number'] for pr in closed if recently_merged(pr, self.lookback_cutoff)
+                       and dependency_bot(pr))
+        numbers.extend(number for number, pr in self.mirrors.items() if pr['state'] == 'open')
+        return list(dict.fromkeys(numbers))
 
     def tree(self, sha):
         api = self.api
@@ -368,7 +398,8 @@ class Mirror:
         existing = self.mirrors.get(number)
         open_mirror = existing if existing and existing['state'] == 'open' else None
         ineligible = None
-        if pr['state'] != 'open' or pr['draft'] or pr['base']['ref'] != BRANCH:
+        live = pr['state'] == 'open' or recently_merged(pr, self.lookback_cutoff, open_mirror)
+        if not live or pr['draft'] or pr['base']['ref'] != BRANCH:
             ineligible = 'skipped'
         elif not dependency_bot(pr):
             ineligible = 'untrusted_author'
@@ -497,18 +528,13 @@ def main():
     sync = sub.add_parser('sync')
     sync.add_argument('--pr', type=int, action='append')
     sync.add_argument('--since-hours', type=float)
+    sync.add_argument('--lookback-days', type=int, default=LOOKBACK_DAYS)
     sync.add_argument('--dry-run', action='store_true')
     sync.add_argument('--no-open-pr', action='store_true')
     args = parser.parse_args()
     api = API()
-    mirror = Mirror(api, args.dry_run, args.no_open_pr)
-    numbers = args.pr
-    if not numbers:
-        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=args.since_hours)
-                  if args.since_hours is not None else None)
-        numbers = [pr['number'] for pr in api.pages(SOURCE, f'pulls?state=open&base={BRANCH}&sort=created&direction=desc')
-                   if cutoff is None or datetime.datetime.fromisoformat(pr['created_at'].replace('Z', '+00:00')) >= cutoff]
-        numbers = list(dict.fromkeys(numbers + [n for n, pr in mirror.mirrors.items() if pr['state'] == 'open']))
+    mirror = Mirror(api, args.dry_run, args.no_open_pr, args.lookback_days)
+    numbers = args.pr or mirror.candidates(args.since_hours)
     failed = False
     for number in numbers:
         try:
