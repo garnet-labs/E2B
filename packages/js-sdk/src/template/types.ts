@@ -1,0 +1,1198 @@
+import { ReadyCmd } from './readycmd'
+import type { PathLike } from 'node:fs'
+import type { LogEntry } from './logger'
+import type { McpServer } from '../sandbox/mcp'
+import { ConnectionOpts } from '../connectionConfig'
+import type { components } from '../api'
+
+/**
+ * Options for creating a new template.
+ */
+export type TemplateOptions = {
+  /**
+   * Path to the directory containing files to be copied into the template.
+   * @default Current directory from template location
+   */
+  fileContextPath?: PathLike
+  /**
+   * Patterns in `.dockerignore` syntax for files to exclude when copying.
+   * They are applied after the `.dockerignore` file in the context directory, so they take precedence over it.
+   * An invalid pattern (such as an unterminated `[`) throws a `TemplateError`.
+   * Brace expansion (`{a,b}`) is not supported, as in Docker.
+   */
+  fileIgnorePatterns?: string[]
+}
+
+/**
+ * Basic options for building a template.
+ */
+export type BasicBuildOptions = {
+  /**
+   * Alias name for the template.
+   * @deprecated Use the `name` parameter of `Template.build()` instead.
+   */
+  alias: string
+  /**
+   * Tags to assign to the template build.
+   */
+  tags?: string[]
+  /**
+   * Number of CPUs allocated to the sandbox.
+   */
+  cpuCount?: number
+  /**
+   * Maximum number of CPUs allocated to the sandbox.
+   * Setting it makes the template resizable. Must be at least `cpuCount`.
+   */
+  maxCpuCount?: number
+  /**
+   * Amount of memory in MB allocated to the sandbox.
+   */
+  memoryMB?: number
+  /**
+   * Requested minimum free space for the template filesystem after the build steps
+   * have run, in MiB. Growth is best effort and the filesystem is never shrunk.
+   * Omit to use the team default or set to 0 to request no growth.
+   */
+  minFreeDiskMb?: number
+  /**
+   * If true, skips cache and forces a complete rebuild.
+   * @default false
+   */
+  skipCache?: boolean
+  /**
+   * Callback function to receive build logs during the build process.
+   */
+  onBuildLogs?: (logEntry: LogEntry) => void
+}
+
+/**
+ * Options for building a template with authentication.
+ */
+export type BuildOptions = ConnectionOpts & BasicBuildOptions
+
+/**
+ * Information about a built template.
+ */
+export type BuildInfo = {
+  /**
+   * First alias from the build (for backward compatibility).
+   * @deprecated Use `name` instead.
+   */
+  alias: string
+  /**
+   * Name of the template.
+   */
+  name: string
+  /**
+   * Tags assigned to this build.
+   */
+  tags: string[]
+  /**
+   * Template identifier.
+   */
+  templateId: string
+  /**
+   * Build identifier.
+   */
+  buildId: string
+}
+
+/**
+ * Options for getting build status.
+ */
+export type GetBuildStatusOptions = ConnectionOpts & { logsOffset?: number }
+
+/**
+ * Every status of a template build.
+ */
+export const TEMPLATE_BUILD_STATUSES = [
+  'building',
+  'waiting',
+  'ready',
+  'error',
+] as const
+
+/**
+ * Status of a template build.
+ */
+export type TemplateBuildStatus = (typeof TEMPLATE_BUILD_STATUSES)[number]
+
+/**
+ * Reason for the current build status (typically for errors).
+ */
+export type BuildStatusReason = {
+  /**
+   * Message with the status reason.
+   */
+  message: string
+  /**
+   * Step that failed.
+   */
+  step?: string
+  /**
+   * Log entries related to the status reason.
+   */
+  logEntries: LogEntry[]
+}
+
+/**
+ * Response from getting build status.
+ */
+export type TemplateBuildStatusResponse = {
+  /**
+   * Build identifier.
+   */
+  buildID: string
+  /**
+   * Template identifier.
+   */
+  templateID: string
+  /**
+   * Current status of the build.
+   */
+  status: TemplateBuildStatus
+  /**
+   * Build log entries.
+   */
+  logEntries: LogEntry[]
+  /**
+   * Build logs (raw strings). Always empty since the V1 build path was removed.
+   * @deprecated Use `logEntries` instead. Will be removed in the next major version.
+   */
+  logs: string[]
+  /**
+   * Reason for the current status (typically for errors).
+   */
+  reason?: BuildStatusReason
+}
+
+/**
+ * Information about assigned template tags.
+ */
+export type TemplateTagInfo = {
+  /**
+   * Build identifier associated with this tag.
+   */
+  buildId: string
+  /**
+   * Assigned tags of the template.
+   */
+  tags: string[]
+}
+
+/**
+ * Information about a template.
+ */
+export type TemplateInfo = {
+  /**
+   * Template identifier.
+   */
+  templateId: string
+  /**
+   * Identifier of the last successful build of the template.
+   */
+  buildId: string
+  /**
+   * Names of the template (`namespace/name` when namespaced).
+   */
+  names: string[]
+  /**
+   * Description of the template.
+   */
+  description?: string
+  /**
+   * Whether the template is public or only accessible by the project.
+   */
+  public: boolean
+  /**
+   * Whether the template is one of the platform's default templates.
+   */
+  isDefault: boolean
+  /**
+   * Status of the last template build.
+   */
+  buildStatus: TemplateBuildStatus
+  /**
+   * Number of CPUs allocated to the sandbox.
+   */
+  cpuCount: number
+  /**
+   * Maximum number of CPUs a sandbox can be started with. Set only for
+   * resizable templates.
+   */
+  maxCpuCount?: number
+  /**
+   * Amount of memory in MiB allocated to the sandbox.
+   */
+  memoryMB: number
+  /**
+   * Disk size in MiB of the sandbox.
+   */
+  diskSizeMB: number
+  /**
+   * Version of envd running in the sandbox.
+   */
+  envdVersion: string
+  /**
+   * Number of times the template was built.
+   */
+  buildCount: number
+  /**
+   * Number of times the template was used to create a sandbox.
+   */
+  spawnCount: number
+  /**
+   * When the template was created.
+   */
+  createdAt: Date
+  /**
+   * When the template was last updated.
+   */
+  updatedAt: Date
+  /**
+   * When the template was last used to create a sandbox.
+   */
+  lastSpawnedAt?: Date
+}
+
+export function convertTemplateInfo(
+  template: components['schemas']['Template']
+): TemplateInfo {
+  return {
+    templateId: template.templateID,
+    buildId: template.buildID,
+    names: template.names,
+    ...(template.description && { description: template.description }),
+    public: template.public,
+    isDefault: template.isDefault ?? false,
+    buildStatus: template.buildStatus,
+    cpuCount: template.cpuCount,
+    ...(template.maxCpuCount != null && { maxCpuCount: template.maxCpuCount }),
+    memoryMB: template.memoryMB,
+    diskSizeMB: template.diskSizeMB,
+    envdVersion: template.envdVersion,
+    buildCount: template.buildCount,
+    spawnCount: template.spawnCount,
+    createdAt: new Date(template.createdAt),
+    updatedAt: new Date(template.updatedAt),
+    ...(template.lastSpawnedAt && {
+      lastSpawnedAt: new Date(template.lastSpawnedAt),
+    }),
+  }
+}
+
+/**
+ * Information about a template build.
+ */
+export type TemplateBuildInfo = {
+  /**
+   * Build identifier.
+   */
+  buildId: string
+  /**
+   * Status of the build.
+   */
+  status: TemplateBuildStatus
+  /**
+   * Number of CPUs a sandbox created from the build starts with.
+   */
+  cpuCount: number
+  /**
+   * Maximum number of CPUs a sandbox can be started with. Set only for
+   * resizable builds.
+   */
+  maxCpuCount?: number
+  /**
+   * Amount of memory in MiB allocated to the sandbox.
+   */
+  memoryMB: number
+  /**
+   * Disk size in MiB of the sandbox.
+   */
+  diskSizeMB?: number
+  /**
+   * Version of envd running in the sandbox.
+   */
+  envdVersion?: string
+  /**
+   * When the build was created.
+   */
+  createdAt: Date
+  /**
+   * When the build was last updated.
+   */
+  updatedAt: Date
+  /**
+   * When the build finished.
+   */
+  finishedAt?: Date
+}
+
+export function convertTemplateBuildInfo(
+  build: components['schemas']['TemplateBuild']
+): TemplateBuildInfo {
+  return {
+    buildId: build.buildID,
+    status: build.status,
+    cpuCount: build.cpuCount,
+    ...(build.maxCpuCount != null && { maxCpuCount: build.maxCpuCount }),
+    memoryMB: build.memoryMB,
+    ...(build.diskSizeMB != null && { diskSizeMB: build.diskSizeMB }),
+    ...(build.envdVersion != null && { envdVersion: build.envdVersion }),
+    createdAt: new Date(build.createdAt),
+    updatedAt: new Date(build.updatedAt),
+    ...(build.finishedAt && { finishedAt: new Date(build.finishedAt) }),
+  }
+}
+
+/**
+ * A template build with the tags that point at it, as listed by
+ * `Template.listBuilds`.
+ */
+export type TemplateBuildWithTags = TemplateBuildInfo & {
+  /**
+   * Tags of the template that point at this build. A tag points at the latest
+   * ready build it was assigned to, the build a sandbox created with that tag
+   * starts from.
+   */
+  tags: string[]
+}
+
+export function convertTemplateBuildWithTags(
+  build: components['schemas']['TemplateBuildWithTags']
+): TemplateBuildWithTags {
+  return { ...convertTemplateBuildInfo(build), tags: build.tags }
+}
+
+/**
+ * A template with its default build, as returned by `Template.getInfo`.
+ *
+ * The build fields that `TemplateInfo` (an item of `Template.list`) carries at
+ * the top level, such as `buildId` and `cpuCount`, are under `defaultBuild`
+ * here.
+ */
+export type TemplateDetail = {
+  /**
+   * Template identifier.
+   */
+  templateId: string
+  /**
+   * Names of the template (`namespace/name` when namespaced).
+   */
+  names: string[]
+  /**
+   * Description of the template.
+   */
+  description?: string
+  /**
+   * Whether the template is public or only accessible by the project.
+   */
+  public: boolean
+  /**
+   * Whether the template is one of the platform's default templates.
+   */
+  isDefault: boolean
+  /**
+   * Status of the latest build tagged `default`, in any state. It is `waiting`
+   * or `building` while a rebuild runs and `error` after a failed one,
+   * although sandboxes still start from `defaultBuild`.
+   */
+  buildStatus: TemplateBuildStatus
+  /**
+   * Build a sandbox created without a tag starts from: the latest ready build
+   * tagged `default`, so its `status` is always `ready`. Not set until such a
+   * build is ready.
+   */
+  defaultBuild?: TemplateBuildInfo
+  /**
+   * Number of times the template was built.
+   */
+  buildCount: number
+  /**
+   * Number of times the template was used to create a sandbox.
+   */
+  spawnCount: number
+  /**
+   * When the template was created.
+   */
+  createdAt: Date
+  /**
+   * When the template was last updated.
+   */
+  updatedAt: Date
+  /**
+   * When the template was last used to create a sandbox.
+   */
+  lastSpawnedAt?: Date
+}
+
+export function convertTemplateDetail(
+  template: components['schemas']['TemplateV2']
+): TemplateDetail {
+  return {
+    templateId: template.templateID,
+    names: template.names,
+    ...(template.description && { description: template.description }),
+    public: template.public,
+    isDefault: template.isDefault,
+    buildStatus: template.buildStatus,
+    ...(template.defaultBuild && {
+      defaultBuild: convertTemplateBuildInfo(template.defaultBuild),
+    }),
+    buildCount: template.buildCount,
+    spawnCount: template.spawnCount,
+    createdAt: new Date(template.createdAt),
+    updatedAt: new Date(template.updatedAt),
+    ...(template.lastSpawnedAt && {
+      lastSpawnedAt: new Date(template.lastSpawnedAt),
+    }),
+  }
+}
+
+/**
+ * Options for listing templates.
+ */
+export interface TemplateListOpts extends Omit<ConnectionOpts, 'signal'> {
+  /**
+   * Maximum number of templates to return per page.
+   *
+   * @default 100
+   */
+  limit?: number
+  /**
+   * Token to the next page.
+   */
+  nextToken?: string
+}
+
+/**
+ * Options for listing the builds of a template.
+ */
+export interface TemplateBuildListOpts extends Omit<ConnectionOpts, 'signal'> {
+  /**
+   * Statuses. Only builds with one of them are listed.
+   */
+  statuses?: TemplateBuildStatus[]
+  /**
+   * Tags. Only the builds they point at are listed. A tag points only at a
+   * ready build, so a tag with no ready build gives an empty page.
+   */
+  tags?: string[]
+  /**
+   * Maximum number of builds to return per page, at most 100.
+   *
+   * @default 100
+   */
+  limit?: number
+  /**
+   * Token to the next page.
+   */
+  nextToken?: string
+}
+
+/**
+ * Detailed information about a single template tag.
+ */
+export type TemplateTag = {
+  /**
+   * Name of the tag.
+   */
+  tag: string
+  /**
+   * Build identifier associated with this tag.
+   */
+  buildId: string
+  /**
+   * When this tag was assigned.
+   */
+  createdAt: Date
+}
+
+/**
+ * Types of instructions that can be used in a template.
+ */
+export enum InstructionType {
+  COPY = 'COPY',
+  ENV = 'ENV',
+  RUN = 'RUN',
+  WORKDIR = 'WORKDIR',
+  USER = 'USER',
+}
+
+/**
+ * Represents a single instruction in the template build process.
+ */
+export type Instruction = {
+  type: InstructionType
+  args: string[]
+  force: boolean
+  forceUpload?: true
+  filesHash?: string
+  resolveSymlinks?: boolean
+  gzip?: boolean
+}
+
+/**
+ * Configuration for a single file/directory copy operation.
+ */
+export type CopyItem = {
+  src: PathLike | PathLike[]
+  dest: PathLike
+  forceUpload?: true
+  user?: string
+  mode?: number
+  resolveSymlinks?: boolean
+  gzip?: boolean
+}
+
+/**
+ * MCP server names that can be installed.
+ */
+export type McpServerName = keyof McpServer
+
+/**
+ * Initial state of a template builder.
+ * Use one of these methods to specify the base image or template to start from.
+ */
+export interface TemplateFromImage {
+  /**
+   * Start from a Debian-based Docker image.
+   * @param variant Debian variant (default: 'stable')
+   *
+   * @example
+   * ```ts
+   * Template().fromDebianImage('bookworm')
+   * ```
+   */
+  fromDebianImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Ubuntu-based Docker image.
+   * @param variant Ubuntu variant (default: 'latest')
+   *
+   * @example
+   * ```ts
+   * Template().fromUbuntuImage('24.04')
+   * ```
+   */
+  fromUbuntuImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from a Fedora-based Docker image.
+   * @param variant Fedora variant (default: '44')
+   *
+   * @example
+   * ```ts
+   * Template().fromFedoraImage('44')
+   * ```
+   */
+  fromFedoraImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Alpine-based Docker image.
+   * @param variant Alpine variant (default: '3.24')
+   *
+   * @example
+   * ```ts
+   * Template().fromAlpineImage('3.24')
+   * ```
+   */
+  fromAlpineImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Arch Linux-based Docker image.
+   *
+   * Defaults to `latest`: Arch is a rolling release and template provisioning
+   * runs `pacman -Syu`, so pinning a tag would not change the built result.
+   * @param variant Arch Linux variant (default: 'latest')
+   *
+   * @example
+   * ```ts
+   * Template().fromArchImage('base-devel')
+   * ```
+   */
+  fromArchImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from a Python-based Docker image.
+   * @param version Python version (default: '3')
+   *
+   * @example
+   * ```ts
+   * Template().fromPythonImage('3')
+   * ```
+   */
+  fromPythonImage(version?: string): TemplateBuilder
+
+  /**
+   * Start from a Node.js-based Docker image.
+   * @param variant Node.js variant (default: 'lts')
+   *
+   * @example
+   * ```ts
+   * Template().fromNodeImage('24')
+   * ```
+   */
+  fromNodeImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from a Bun-based Docker image.
+   * @param variant Bun variant (default: 'latest')
+   *
+   * @example
+   * ```ts
+   * Template().fromBunImage('1.3')
+   * ```
+   */
+  fromBunImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from E2B's default base image (e2bdev/base:latest).
+   *
+   * @example
+   * ```ts
+   * Template().fromBaseImage()
+   * ```
+   */
+  fromBaseImage(): TemplateBuilder
+
+  /**
+   * Start from a custom Docker image.
+   * @param baseImage Docker image name
+   * @param credentials Optional credentials for private registries
+   *
+   * @example
+   * ```ts
+   * Template().fromImage('python:3')
+   *
+   * // With credentials (optional)
+   * Template().fromImage('myregistry.com/myimage:latest', {
+   *   username: 'user',
+   *   password: 'pass'
+   * })
+   * ```
+   */
+  fromImage(
+    baseImage: string,
+    credentials?: { username: string; password: string }
+  ): TemplateBuilder
+
+  /**
+   * Start from an existing E2B template.
+   * @param template E2B template ID or alias
+   *
+   * @example
+   * ```ts
+   * Template().fromTemplate('my-base-template')
+   * ```
+   */
+  fromTemplate(template: string): TemplateBuilder
+
+  /**
+   * Parse a Dockerfile and convert it to Template SDK format.
+   * @param dockerfileContentOrPath Dockerfile content or path
+   *
+   * @example
+   * ```ts
+   * Template().fromDockerfile('Dockerfile')
+   * Template().fromDockerfile('FROM python:3\nRUN pip install numpy')
+   * ```
+   */
+  fromDockerfile(dockerfileContentOrPath: string): TemplateBuilder
+
+  /**
+   * Start from a Docker image in AWS ECR.
+   * @param image Full ECR image path
+   * @param credentials AWS credentials
+   *
+   * @example
+   * ```ts
+   * Template().fromAWSRegistry(
+   *   '123456789.dkr.ecr.us-west-2.amazonaws.com/myimage:latest',
+   *   {
+   *     accessKeyId: 'AKIA...',
+   *     secretAccessKey: '...',
+   *     region: 'us-west-2'
+   *   }
+   * )
+   * ```
+   */
+  fromAWSRegistry(
+    image: string,
+    credentials: {
+      accessKeyId: string
+      secretAccessKey: string
+      region: string
+    }
+  ): TemplateBuilder
+
+  /**
+   * Start from a Docker image in Google Container Registry.
+   * @param image Full GCR/GAR image path
+   * @param credentials GCP service account credentials
+   *
+   * @example
+   * ```ts
+   * Template().fromGCPRegistry(
+   *   'gcr.io/myproject/myimage:latest',
+   *   { serviceAccountJSON: 'path/to/service-account.json' }
+   * )
+   * ```
+   */
+  fromGCPRegistry(
+    image: string,
+    credentials: {
+      serviceAccountJSON: object | string
+    }
+  ): TemplateBuilder
+
+  /**
+   * Skip cache for all subsequent build instructions from this point.
+   *
+   * @example
+   * ```ts
+   * Template().skipCache().fromPythonImage('3')
+   * ```
+   */
+  skipCache(): this
+}
+
+/**
+ * Main builder state for constructing templates.
+ * Provides methods for customizing the template environment.
+ */
+export interface TemplateBuilder {
+  /**
+   * Copy files or directories into the template.
+   * @param src Source path(s)
+   * @param dest Destination path
+   * @param options Copy options
+   *
+   * @example
+   * ```ts
+   * template.copy('requirements.txt', '/home/user/')
+   * template.copy(['app.ts', 'config.ts'], '/app/', { mode: 0o755 })
+   * ```
+   */
+  copy(
+    src: PathLike | PathLike[],
+    dest: PathLike,
+    options?: {
+      forceUpload?: true
+      user?: string
+      mode?: number
+      resolveSymlinks?: boolean
+      gzip?: boolean
+    }
+  ): TemplateBuilder
+
+  /**
+   * Copy multiple items with individual options.
+   * @param items Array of copy items
+   *
+   * @example
+   * ```ts
+   * template.copyItems([
+   *   { src: 'app.ts', dest: '/app/' },
+   *   { src: 'config.ts', dest: '/app/', mode: 0o644 }
+   * ])
+   * ```
+   */
+  copyItems(items: CopyItem[]): TemplateBuilder
+
+  /**
+   * Remove files or directories.
+   * @param path Path(s) to remove
+   * @param options Remove options
+   *
+   * @example
+   * ```ts
+   * template.remove('/tmp/cache', { recursive: true, force: true })
+   * template.remove('/tmp/cache', { recursive: true, force: true, user: 'root' })
+   * ```
+   */
+  remove(
+    path: PathLike | PathLike[],
+    options?: { force?: boolean; recursive?: boolean; user?: string }
+  ): TemplateBuilder
+
+  /**
+   * Rename or move a file or directory.
+   * @param src Source path
+   * @param dest Destination path
+   * @param options Rename options
+   *
+   * @example
+   * ```ts
+   * template.rename('/tmp/old.txt', '/tmp/new.txt')
+   * template.rename('/tmp/old.txt', '/tmp/new.txt', { user: 'root' })
+   * ```
+   */
+  rename(
+    src: PathLike,
+    dest: PathLike,
+    options?: { force?: boolean; user?: string }
+  ): TemplateBuilder
+
+  /**
+   * Create directories.
+   * @param path Directory path(s)
+   * @param options Directory options
+   *
+   * @example
+   * ```ts
+   * template.makeDir('/app/data', { mode: 0o755 })
+   * template.makeDir(['/app/logs', '/app/cache'])
+   * template.makeDir('/app/data', { mode: 0o755, user: 'root' })
+   * ```
+   */
+  makeDir(
+    path: PathLike | PathLike[],
+    options?: { mode?: number; user?: string }
+  ): TemplateBuilder
+
+  /**
+   * Create a symbolic link.
+   * @param src Source path (target)
+   * @param dest Destination path (symlink location)
+   * @param options Symlink options
+   *
+   * @example
+   * ```ts
+   * template.makeSymlink('/usr/bin/python3', '/usr/bin/python')
+   * template.makeSymlink('/usr/bin/python3', '/usr/bin/python', { user: 'root' })
+   * template.makeSymlink('/usr/bin/python3', '/usr/bin/python', { force: true })
+   * ```
+   */
+  makeSymlink(
+    src: PathLike,
+    dest: PathLike,
+    options?: { user?: string; force?: boolean }
+  ): TemplateBuilder
+
+  /**
+   * Run a shell command.
+   * @param command Command string
+   * @param options Command options
+   *
+   * @example
+   * ```ts
+   * template.runCmd('apt-get update')
+   * template.runCmd(['pip install numpy', 'pip install pandas'])
+   * template.runCmd('apt-get install vim', { user: 'root' })
+   * ```
+   */
+  runCmd(command: string, options?: { user?: string }): TemplateBuilder
+
+  /**
+   * Run multiple shell commands.
+   * @param commands Array of command strings
+   * @param options Command options
+   */
+  runCmd(commands: string[], options?: { user?: string }): TemplateBuilder
+
+  /**
+   * Run command(s).
+   * @param commandOrCommands Command or commands
+   * @param options Command options
+   */
+  runCmd(
+    commandOrCommands: string | string[],
+    options?: { user?: string }
+  ): TemplateBuilder
+
+  /**
+   * Set the working directory.
+   * @param workdir Working directory path
+   *
+   * @example
+   * ```ts
+   * template.setWorkdir('/app')
+   * ```
+   */
+  setWorkdir(workdir: PathLike): TemplateBuilder
+
+  /**
+   * Set the user for subsequent commands.
+   * @param user Username
+   *
+   * @example
+   * ```ts
+   * template.setUser('root')
+   * ```
+   */
+  setUser(user: string): TemplateBuilder
+
+  /**
+   * Install Python packages using pip.
+   * @param packages Package name(s) or undefined for current directory
+   * @param options Install options
+   * @param options.g Install globally as root (default: true). Set to false for user-only installation with --user flag
+   *
+   * @example
+   * ```ts
+   * template.pipInstall('numpy')  // Installs globally (default)
+   * template.pipInstall(['pandas', 'scikit-learn'])
+   * template.pipInstall('numpy', { g: false })  // Install for user only
+   * template.pipInstall()  // Installs from current directory
+   * ```
+   */
+  pipInstall(
+    packages?: string | string[],
+    options?: { g?: boolean }
+  ): TemplateBuilder
+
+  /**
+   * Install Node.js packages using npm.
+   * @param packages Package name(s) or undefined for package.json
+   * @param options Install options
+   *
+   * @example
+   * ```ts
+   * template.npmInstall('express')
+   * template.npmInstall(['lodash', 'axios'])
+   * template.npmInstall('tsx', { g: true })
+   * template.npmInstall('typescript', { dev: true })
+   * template.npmInstall()  // Installs from package.json
+   * ```
+   */
+  npmInstall(
+    packages?: string | string[],
+    options?: { g?: boolean; dev?: boolean }
+  ): TemplateBuilder
+  /**
+   * Install Bun packages using bun.
+   * @param packages Package name(s) or undefined for package.json
+   * @param options Install options
+   *
+   * @example
+   * ```ts
+   * template.bunInstall('express')
+   * template.bunInstall(['lodash', 'axios'])
+   * template.bunInstall('tsx', { g: true })
+   * template.bunInstall('typescript', { dev: true })
+   * template.bunInstall()  // Installs from package.json
+   * ```
+   */
+  bunInstall(
+    packages?: string | string[],
+    options?: { g?: boolean; dev?: boolean }
+  ): TemplateBuilder
+
+  /**
+   * Install Debian/Ubuntu packages using apt-get.
+   * @param packages Package name(s)
+   *
+   * @example
+   * ```ts
+   * template.aptInstall('vim')
+   * template.aptInstall(['git', 'curl', 'wget'])
+   * template.aptInstall(['vim'], { noInstallRecommends: true })
+   * template.aptInstall(['vim'], { fixMissing: true })
+   * ```
+   */
+  aptInstall(
+    packages: string | string[],
+    options?: { noInstallRecommends?: boolean; fixMissing?: boolean }
+  ): TemplateBuilder
+
+  /**
+   * Install MCP servers using mcp-gateway.
+   * Note: Requires a base image with mcp-gateway pre-installed (e.g., mcp-gateway).
+   * @param servers MCP server name(s)
+   *
+   * @throws {Error} If the base template is not mcp-gateway
+   * @example
+   * ```ts
+   * template.addMcpServer('exa')
+   * template.addMcpServer(['brave', 'firecrawl', 'duckduckgo'])
+   * ```
+   */
+  addMcpServer(servers: McpServerName | McpServerName[]): TemplateBuilder
+
+  /**
+   * Clone a Git repository.
+   * @param url Repository URL
+   * @param path Optional destination path
+   * @param options Clone options
+   *
+   * @example
+   * ```ts
+   * template.gitClone('https://github.com/user/repo.git', '/app/repo')
+   * template.gitClone('https://github.com/user/repo.git', undefined, {
+   *   branch: 'main',
+   *   depth: 1
+   * })
+   * template.gitClone('https://github.com/user/repo.git', '/app/repo', {
+   *   user: 'root'
+   * })
+   * ```
+   */
+  gitClone(
+    url: string,
+    path?: PathLike,
+    options?: { branch?: string; depth?: number; user?: string }
+  ): TemplateBuilder
+
+  /**
+   * Set environment variables.
+   * Note: Environment variables defined here are available only during template build.
+   * @param envs Environment variables
+   *
+   * @example
+   * ```ts
+   * template.setEnvs({ NODE_ENV: 'production', PORT: '8080' })
+   * ```
+   */
+  setEnvs(envs: Record<string, string>): TemplateBuilder
+
+  /**
+   * Skip cache for all subsequent build instructions from this point.
+   *
+   * @example
+   * ```ts
+   * template.skipCache().runCmd('apt-get update')
+   * ```
+   */
+  skipCache(): this
+
+  /**
+   * Set the start command and ready check.
+   * @param startCommand Command to run on startup
+   * @param readyCommand Command to check readiness
+   *
+   * @example
+   * ```ts
+   * // Using a string command
+   * template.setStartCmd(
+   *   'node app.js',
+   *   'curl http://localhost:8000/health'
+   * )
+   *
+   * // Using ReadyCmd helpers
+   * import { waitForPort, waitForURL } from 'e2b'
+   *
+   * template.setStartCmd(
+   *   'python -m http.server 8000',
+   *   waitForPort(8000)
+   * )
+   *
+   * template.setStartCmd(
+   *   'npm start',
+   *   waitForURL('http://localhost:3000/health', 200)
+   * )
+   * ```
+   */
+  setStartCmd(
+    startCommand: string,
+    readyCommand: string | ReadyCmd
+  ): TemplateFinal
+
+  /**
+   * Set or update the ready check command.
+   * @param readyCommand Command to check readiness
+   *
+   * @example
+   * ```ts
+   * // Using a string command
+   * template.setReadyCmd('curl http://localhost:8000/health')
+   *
+   * // Using ReadyCmd helpers
+   * import { waitForPort, waitForFile, waitForProcess } from 'e2b'
+   *
+   * template.setReadyCmd(waitForPort(3000))
+   *
+   * template.setReadyCmd(waitForFile('/tmp/ready'))
+   *
+   * template.setReadyCmd(waitForProcess('nginx'))
+   * ```
+   */
+  setReadyCmd(readyCommand: string | ReadyCmd): TemplateFinal
+
+  /**
+   * Prebuild a devcontainer from the specified directory.
+   * @param devcontainerDirectory Path to the devcontainer directory
+   *
+   * @example
+   * ```ts
+   * template
+   *  .gitClone('https://myrepo.com/project.git', '/my-devcontainer')
+   *  .betaDevContainerPrebuild('/my-devcontainer')
+   * ```
+   */
+  betaDevContainerPrebuild(devcontainerDirectory: string): TemplateBuilder
+
+  /**
+   * Start a devcontainer from the specified directory.
+   * @param devcontainerDirectory Path to the devcontainer directory
+   *
+   * @example
+   * ```ts
+   * template
+   *  .gitClone('https://myrepo.com/project.git', '/my-devcontainer')
+   *  .startDevcontainer('/my-devcontainer')
+   *
+   * // Prebuild and start
+   * template
+   *  .gitClone('https://myrepo.com/project.git', '/my-devcontainer')
+   *  .betaDevContainerPrebuild('/my-devcontainer')
+   *  // Other instructions...
+   *  .betaSetDevContainerStart('/my-devcontainer')
+   * ```
+   */
+  betaSetDevContainerStart(devcontainerDirectory: string): TemplateFinal
+}
+
+/**
+ * Final state of a template after start/ready commands are set.
+ * The template can only be built in this state.
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface TemplateFinal {}
+
+/**
+ * Configuration for a generic Docker registry with basic authentication.
+ */
+export type GenericDockerRegistry = {
+  /** Registry type identifier */
+  type: 'registry'
+  /** Registry username */
+  username: string
+  /** Registry password */
+  password: string
+}
+
+/**
+ * Configuration for AWS Elastic Container Registry (ECR).
+ */
+export type AWSRegistry = {
+  /** Registry type identifier */
+  type: 'aws'
+  /** AWS access key ID */
+  awsAccessKeyId: string
+  /** AWS secret access key */
+  awsSecretAccessKey: string
+  /** AWS region */
+  awsRegion: string
+}
+
+/**
+ * Configuration for Google Container Registry (GCR) or Artifact Registry.
+ */
+export type GCPRegistry = {
+  /** Registry type identifier */
+  type: 'gcp'
+  /** Service account JSON as string */
+  serviceAccountJson: string
+}
+
+/**
+ * Union type for all supported container registry configurations.
+ */
+export type RegistryConfig = GenericDockerRegistry | AWSRegistry | GCPRegistry
+
+/**
+ * Type representing a template in any state (builder or final).
+ */
+export type TemplateClass = TemplateBuilder | TemplateFinal
