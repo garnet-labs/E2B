@@ -1,0 +1,94 @@
+import * as commander from '@commander-js/extra-typings'
+
+import { Auth, ensureAuth } from 'src/api'
+import { asBold } from 'src/utils/format'
+import * as e2b from 'e2b'
+import { Sandbox } from 'e2b'
+import { parseMetadata, parseSandboxStates } from './utils'
+
+async function killSandbox(sandboxID: string, auth: Auth) {
+  const killed = await e2b.Sandbox.kill(sandboxID, auth)
+  if (killed) {
+    console.log(`Sandbox ${asBold(sandboxID)} has been killed`)
+  } else {
+    console.error(`Sandbox ${asBold(sandboxID)} wasn't found`)
+  }
+}
+
+export const killCommand = new commander.Command('kill')
+  .description('kill sandbox')
+  .argument(
+    '[sandboxIDs...]',
+    `kill the sandboxes specified by ${asBold('[sandboxIDs...]')}`
+  )
+  .alias('kl')
+  .option('-a, --all', 'kill all sandboxes')
+  .option(
+    '-s, --state <state>',
+    'when used with -a/--all flag, filter by state, eg. running, paused. Defaults to running',
+    parseSandboxStates
+  )
+  .option(
+    '-m, --metadata <metadata>',
+    'when used with -a/--all flag, filter by metadata, eg. key1=value1',
+    parseMetadata
+  )
+  .action(async (sandboxIDs, { all, state, metadata }) => {
+    try {
+      const auth = await ensureAuth()
+      const sandboxesState = state || ['running']
+
+      if ((!sandboxIDs || sandboxIDs.length === 0) && !all) {
+        console.error(
+          `You need to specify ${asBold('[sandboxIDs...]')} or use ${asBold(
+            '-a/--all'
+          )} flag`
+        )
+        process.exit(1)
+      }
+
+      if (all && sandboxIDs && sandboxIDs.length > 0) {
+        console.error(
+          `You cannot use ${asBold(
+            '-a/--all'
+          )} flag while specifying ${asBold('[sandboxIDs...]')}`
+        )
+        process.exit(1)
+      }
+
+      if (all) {
+        let total = 0
+        const iterator = Sandbox.list({
+          ...auth,
+          query: {
+            state: sandboxesState,
+            metadata,
+          },
+        })
+
+        while (iterator.hasNext) {
+          const sandboxes = await iterator.nextItems()
+          total += sandboxes.length
+
+          await Promise.all(
+            sandboxes.map((sandbox) => killSandbox(sandbox.sandboxId, auth))
+          )
+        }
+
+        if (total === 0) {
+          console.log('No running sandboxes')
+        } else {
+          console.log(`Killed ${total} running sandboxes`)
+        }
+
+        process.exit(0)
+      } else {
+        await Promise.all(
+          sandboxIDs.map((sandboxID) => killSandbox(sandboxID, auth))
+        )
+      }
+    } catch (err: any) {
+      console.error(err)
+      process.exit(1)
+    }
+  })

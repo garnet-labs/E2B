@@ -1,0 +1,413 @@
+import {
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
+import { SandboxError } from '../../errors'
+import { ConnectResponse, StartResponse } from '../../envd/process/process_pb'
+import type { CommandRequestOpts } from '.'
+
+declare const __brand: unique symbol
+type Brand<B> = { [__brand]: B }
+type Branded<T, B> = T & Brand<B>
+
+export type Stdout = Branded<string, 'stdout'>
+export type Stderr = Branded<string, 'stderr'>
+export type PtyOutput = Branded<Uint8Array, 'pty'>
+
+/**
+ * Type of the accumulated command output: `string` when `retainOutput` is
+ * omitted or `true`, `undefined` when it is `false`, and `string | undefined`
+ * when it is only known to be a `boolean`.
+ */
+export type CommandOutput<RetainOutput extends boolean | undefined = true> = [
+  RetainOutput,
+] extends [true | undefined]
+  ? string
+  : [RetainOutput] extends [false]
+    ? undefined
+    : string | undefined
+
+/**
+ * Command execution result.
+ */
+export interface CommandResult<Output extends string | undefined = string> {
+  /**
+   * Command execution exit code.
+   * `0` if the command finished successfully.
+   */
+  exitCode: number
+  /**
+   * Error message from command execution if it failed.
+   */
+  error?: string
+  /**
+   * Command stdout output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  stdout: Output
+  /**
+   * Command stderr output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  stderr: Output
+}
+
+/**
+ * Error thrown when a command exits with a non-zero exit code.
+ */
+export class CommandExitError<Output extends string | undefined = string>
+  extends SandboxError
+  implements CommandResult<Output>
+{
+  constructor(private readonly result: CommandResult<Output>) {
+    super(result.error)
+    this.name = 'CommandExitError'
+  }
+
+  /**
+   * Command execution exit code.
+   * `0` if the command finished successfully.
+   */
+  get exitCode() {
+    return this.result.exitCode
+  }
+
+  /**
+   * Error message from command execution.
+   */
+  get error() {
+    return this.result.error
+  }
+
+  /**
+   * Command execution stdout output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  get stdout() {
+    return this.result.stdout
+  }
+
+  /**
+   * Command execution stderr output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  get stderr() {
+    return this.result.stderr
+  }
+}
+
+/**
+ * Command execution handle.
+ *
+ * It provides methods for waiting for the command to finish, retrieving stdout/stderr, and killing the command.
+ *
+ * @property {number} pid process ID of the command.
+ */
+export class CommandHandle<Output extends string | undefined = string>
+  implements
+    Omit<CommandResult<Output>, 'exitCode' | 'error'>,
+    Partial<Pick<CommandResult<Output>, 'exitCode' | 'error'>>
+{
+  private _stdout?: string
+  private _stderr?: string
+
+  private readonly stdoutDecoder = new TextDecoder()
+  private readonly stderrDecoder = new TextDecoder()
+
+  private result?: CommandResult<Output>
+  private iterationError?: Error
+
+  private disconnected = false
+
+  private readonly _wait: Promise<void>
+
+  /**
+   * @hidden
+   * @internal
+   * @access protected
+   */
+  constructor(
+    readonly pid: number,
+    private readonly handleDisconnect: () => void,
+    private readonly handleKill: () => Promise<boolean>,
+    private readonly events: AsyncIterable<ConnectResponse | StartResponse>,
+    private readonly onStdout?: (stdout: string) => void | Promise<void>,
+    private readonly onStderr?: (stderr: string) => void | Promise<void>,
+    private readonly onPty?: (pty: Uint8Array) => void | Promise<void>,
+    private readonly handleSendStdin?: (
+      data: string | Uint8Array,
+      opts?: CommandRequestOpts
+    ) => Promise<void>,
+    private readonly handleCloseStdin?: (
+      opts?: CommandRequestOpts
+    ) => Promise<void>,
+    private readonly checkHealth?: SandboxHealthCheck,
+    retainOutput = true
+  ) {
+    if (retainOutput) {
+      this._stdout = ''
+      this._stderr = ''
+    }
+    this._wait = this.handleEvents()
+  }
+
+  /**
+   * Command execution exit code.
+   * `0` if the command finished successfully.
+   *
+   * It is `undefined` if the command is still running.
+   */
+  get exitCode() {
+    return this.result?.exitCode
+  }
+
+  /**
+   * Error message from command execution.
+   */
+  get error() {
+    return this.result?.error
+  }
+
+  /**
+   * Command execution stderr output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  get stderr(): Output {
+    return this._stderr as Output
+  }
+
+  /**
+   * Command execution stdout output.
+   * `undefined` if the command was started with `retainOutput: false`.
+   */
+  get stdout(): Output {
+    return this._stdout as Output
+  }
+
+  /**
+   * Wait for the command to finish and return the result.
+   * If the command exits with a non-zero exit code, it throws a `CommandExitError`.
+   *
+   * @returns `CommandResult` result of command execution.
+   */
+  async wait(): Promise<CommandResult<Output>> {
+    await this._wait
+
+    if (this.iterationError) {
+      throw this.iterationError
+    }
+
+    if (!this.result) {
+      throw new SandboxError('Process exited without a result')
+    }
+
+    if (this.result.exitCode !== 0) {
+      throw new CommandExitError(this.result)
+    }
+
+    return this.result
+  }
+
+  /**
+   * Disconnect from the command.
+   *
+   * The command is not killed, but SDK stops receiving events from the command.
+   * You can reconnect to the command using {@link Commands.connect}.
+   *
+   * Once it returns, the `onStdout`/`onStderr`/`onPty` callbacks are guaranteed
+   * not to fire for output produced after this call. It does not wait for the
+   * event handler to drain, so it returns promptly even for an idle command
+   * whose stream produces no further output.
+   */
+  async disconnect() {
+    this.disconnected = true
+    this.handleDisconnect()
+  }
+
+  /**
+   * Kill the command.
+   * It uses `SIGKILL` signal to kill the command.
+   *
+   * @returns `true` if the command was killed successfully, `false` if the command was not found.
+   */
+  async kill() {
+    return await this.handleKill()
+  }
+
+  /**
+   * Send data to the command stdin.
+   *
+   * The command must have been started with `stdin: true`.
+   *
+   * @param data data to send to the command.
+   * @param opts connection options.
+   */
+  async sendStdin(
+    data: string | Uint8Array,
+    opts?: CommandRequestOpts
+  ): Promise<void> {
+    if (!this.handleSendStdin) {
+      throw new SandboxError(
+        'Sending stdin is not supported for this command handle.'
+      )
+    }
+
+    await this.handleSendStdin(data, opts)
+  }
+
+  /**
+   * Close the command stdin.
+   *
+   * This signals EOF to the command. The command must have been started with
+   * `stdin: true`.
+   *
+   * @param opts connection options.
+   */
+  async closeStdin(opts?: CommandRequestOpts): Promise<void> {
+    if (!this.handleCloseStdin) {
+      throw new SandboxError(
+        'Closing stdin is not supported for this command handle.'
+      )
+    }
+
+    await this.handleCloseStdin(opts)
+  }
+
+  private appendStdout(out: string) {
+    if (this._stdout !== undefined) {
+      this._stdout += out
+    }
+  }
+
+  private appendStderr(out: string) {
+    if (this._stderr !== undefined) {
+      this._stderr += out
+    }
+  }
+
+  /**
+   * Flush any bytes still buffered in the stream decoders.
+   *
+   * Incomplete trailing UTF-8 sequences are emitted as replacement
+   * characters, matching the per-chunk decoding behavior.
+   */
+  private *flushDecoders(): Generator<
+    [Stdout, null, null] | [null, Stderr, null]
+  > {
+    const stdoutRest = this.stdoutDecoder.decode()
+    if (stdoutRest) {
+      this.appendStdout(stdoutRest)
+      yield [stdoutRest as Stdout, null, null]
+    }
+    const stderrRest = this.stderrDecoder.decode()
+    if (stderrRest) {
+      this.appendStderr(stderrRest)
+      yield [null, stderrRest as Stderr, null]
+    }
+  }
+
+  private async *iterateEvents(): AsyncGenerator<
+    [Stdout, null, null] | [null, Stderr, null] | [null, null, PtyOutput]
+  > {
+    try {
+      for await (const event of this.events) {
+        const e = event?.event?.event
+        let out: string | undefined
+
+        switch (e?.case) {
+          case 'data':
+            switch (e.value.output.case) {
+              case 'stdout':
+                out = this.stdoutDecoder.decode(e.value.output.value, {
+                  stream: true,
+                })
+                if (out) {
+                  this.appendStdout(out)
+                  yield [out as Stdout, null, null]
+                }
+                break
+              case 'stderr':
+                out = this.stderrDecoder.decode(e.value.output.value, {
+                  stream: true,
+                })
+                if (out) {
+                  this.appendStderr(out)
+                  yield [null, out as Stderr, null]
+                }
+                break
+              case 'pty':
+                yield [null, null, e.value.output.value as PtyOutput]
+                break
+            }
+            break
+          case 'end': {
+            // Flush trailing decoder bytes into the accumulators and record the
+            // result *before* yielding the flushed chunks. A disconnected
+            // consumer breaks out of `handleEvents` on the first yielded chunk,
+            // which would otherwise abort this generator before `this.result`
+            // is assigned and make `wait()` fail as if the process never
+            // produced a result.
+            const flushed = [...this.flushDecoders()]
+            this.result = {
+              exitCode: e.value.exitCode,
+              error: e.value.error,
+              stdout: this.stdout,
+              stderr: this.stderr,
+            }
+            for (const chunk of flushed) {
+              yield chunk
+            }
+            break
+          }
+        }
+      }
+    } catch (e) {
+      // The stream raised before an `end` event (e.g. disconnect or RPC
+      // failure). Flush any bytes still buffered in the decoders so incomplete
+      // trailing sequences surface as replacement characters instead of being
+      // silently dropped, then re-raise so the error is still surfaced.
+      yield* this.flushDecoders()
+      throw e
+    }
+
+    // If the stream closed without an `end` event (e.g. disconnect or a
+    // dropped connection), flush any bytes still buffered in the decoders so
+    // incomplete trailing sequences surface as replacement characters instead
+    // of being silently dropped.
+    if (this.result === undefined) {
+      yield* this.flushDecoders()
+    }
+  }
+
+  private async handleEvents() {
+    try {
+      for await (const [stdout, stderr, pty] of this.iterateEvents()) {
+        // The handle was disconnected — stop dispatching to the callbacks. The
+        // flag is checked before every dispatch, so no callback fires for
+        // output that arrives (or was buffered) after disconnect() was called,
+        // even if the underlying abort hasn't torn the stream down yet. There
+        // is no synchronous suspension point between this check and the
+        // dispatch below, so disconnect() cannot interleave to let a late event
+        // slip through.
+        if (this.disconnected) {
+          break
+        }
+
+        if (stdout !== null) {
+          await this.onStdout?.(stdout)
+        } else if (stderr !== null) {
+          await this.onStderr?.(stderr)
+        } else if (pty) {
+          await this.onPty?.(pty)
+        }
+      }
+    } catch (e) {
+      this.iterationError = await handleRpcErrorWithHealthCheck(
+        e,
+        this.checkHealth
+      )
+    } finally {
+      this.handleDisconnect()
+    }
+  }
+}
